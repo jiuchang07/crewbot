@@ -1,0 +1,16 @@
+[project]
+name = "crewbot"
+version = "0.1.0"
+description = "Self-play bot that learns to play The Crew: The Quest for Planet Nine"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.3",
+]
+
+# NOTE (portability): unlike upstream autoresearch, crewbot does NOT depend on
+# flash-attention / Hopper-only kernels — the policy is a small MLP. It runs on
+# CPU or any CUDA GPU (cuda is auto-detected in train.py). On GaTech PACE,
+# `module load` an appropriate CUDA/PyTorch, or install torch matching the
+# cluster's CUDA from https://pytorch.org.
