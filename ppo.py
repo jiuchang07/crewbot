@@ -56,7 +56,10 @@ SHAPE_COEF = 0.5           # total partial credit available for completing tasks
 WIN_BONUS = 1.0            # terminal reward for full mission success
 START_LEVEL = 3            # curriculum starts on missions 1..START_LEVEL
 LEVEL_STEP = 2
-UP_THRESHOLD = 0.80        # raise level when rolling win rate exceeds this
+# Raise difficulty when the rolling (stochastic) win rate clears this. Kept well
+# below 1.0 because random task assignment caps achievable win rate even on easy
+# missions, so a high bar would stall the curriculum forever.
+UP_THRESHOLD = 0.50
 
 MAX_PLIES = TOTAL_TRICKS * N_P
 
@@ -96,8 +99,9 @@ def rollout(model, rng, level, device, batch):
 
         O.append(obs); A.append(action); LP.append(logp); V.append(value)
         LE.append(legal); R.append(reward); AC.append(active); TM.append(just_done)
-        if bool(vec.done.all()):
-            break
+        # NB: no per-ply .all() sync here — that GPU->CPU stall dominated runtime.
+        # Stepping already-done games is a cheap masked no-op, so just run the
+        # full fixed horizon (every game finishes within MAX_PLIES anyway).
 
     T = len(O)
     obs = torch.stack(O); act = torch.stack(A); logp = torch.stack(LP)
