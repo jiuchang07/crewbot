@@ -27,16 +27,29 @@ missions the trained policy completes. The ground-truth metric lives in
 5. **Initialize results.tsv** with just the header row.
 6. **Confirm and go.**
 
+## Methods: on-policy PPO (primary) vs offline (bootstrap)
+
+- **`ppo.py` — primary, on-policy.** Generates fresh self-play rollouts with the
+  *current* policy every iteration (batched on GPU via `vec_engine`) and trains
+  with PPO. Data quality rises with the policy, so this is how the bot surpasses
+  the heuristic. Uses reward shaping (partial credit per completed task) and a
+  difficulty curriculum to cope with the sparse win signal. **This is the file
+  the experiment loop edits.**
+- **`train.py` — optional, offline.** Behavior-cloning on a frozen heuristic
+  dataset from `selfplay.py`. Useful as a fast bootstrap / sanity baseline, but
+  its ceiling is the heuristic. Not the main path.
+
 ## What you CAN / CANNOT do
 
-**CAN:** edit `train.py` freely — architecture (width/depth/attention over
-cards), loss (advantage-weighted PG, filtered behavior cloning, value targets),
-optimizer, batch size, data weighting/curriculum, entropy, the self-play
-iteration loop (retrain → regenerate data with the new checkpoint → retrain).
+**CAN:** edit `ppo.py` freely — architecture, PPO hyperparameters (clip, epochs,
+GAE λ/γ, entropy, LR), reward shaping (`SHAPE_COEF`, `WIN_BONUS`), the curriculum
+(`START_LEVEL`, `LEVEL_STEP`, `UP_THRESHOLD`), rollout batch size, and the
+shared model in `train.py:PolicyValueNet`.
 
-**CANNOT:** modify `crew_engine.py` (the rules and the `evaluate_winrate`
-metric are ground truth). Do not change the win condition, the 3-player rules,
-or the observation contract that `selfplay.py`/`train.py` share.
+**CANNOT:** modify `crew_engine.py` (the rules and the `evaluate_winrate` metric
+are ground truth). Do not change the win condition, the 3-player rules, or the
+observation contract. Do not modify `vec_engine.py` without re-running
+`python test_vec_consistency.py` to prove it still matches the scalar engine.
 
 ## The metric
 
@@ -66,18 +79,23 @@ status is `keep`, `discard`, or `crash`. Keep a change iff `win_rate` improved.
 LOOP FOREVER:
 
 1. Look at git state (current branch/commit).
-2. Edit `train.py` with one experimental idea.
+2. Edit `ppo.py` with one experimental idea.
 3. `git commit`.
-4. Run: `python train.py > run.log 2>&1` (redirect; don't flood context).
+4. Run: `python ppo.py --minutes <budget> > run.log 2>&1` (redirect; don't flood
+   context).
 5. Read results: `grep "^win_rate:\|^mission_level:" run.log`.
 6. If empty, the run crashed — `tail -n 50 run.log`, attempt a fix, else skip.
 7. Record in `results.tsv` (leave it untracked by git).
 8. If `win_rate` improved, keep the commit; else `git reset` back.
 
-**Iteration loop (the big lever):** the strongest gains come from AlphaZero-style
-self-improvement — after training a decent model, regenerate data with it
-(`python selfplay.py --policy-ckpt ~/.cache/crewbot/model.pt --hours <h>`), then
-retrain on the stronger data. Consider automating this inside `train.py`.
+Because PPO is on-policy, each run generates its own data — do NOT pre-generate
+a fixed dataset for these experiments (that is only for the offline `train.py`
+path). Keep the time budget fixed across experiments so runs are comparable.
+
+**Ideas when stuck:** stronger curriculum scheduling, KL-based early stopping,
+larger/deeper net, separate policy/value nets, better reward shaping (penalize
+failed tasks, reward retaining trick control), inferring teammates' hands from
+the communication hints, or adding determinized MCTS at decision time.
 
 **NEVER STOP** once the loop has begun. Don't ask the human whether to continue.
 If you run out of ideas: improve the cooperative reasoning (card counting,

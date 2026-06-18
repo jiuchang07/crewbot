@@ -28,3 +28,4 @@ results.tsv
 run.log
 *.pt
 .cache/
+*.log

@@ -65,20 +65,25 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, obs_dim=E.OBS_DIM, act_dim=E.ACT_DIM, hidden=HIDDEN, n_blocks=N_BLOCKS):
+    def __init__(self, obs_dim=E.OBS_DIM, act_dim=E.ACT_DIM, hidden=HIDDEN, n_blocks=N_BLOCKS,
+                 bounded_value=True):
         super().__init__()
         self.stem = nn.Sequential(nn.Linear(obs_dim, hidden), nn.ReLU())
         self.blocks = nn.ModuleList([ResBlock(hidden) for _ in range(n_blocks)])
         self.policy_head = nn.Linear(hidden, act_dim)
         self.value_head = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(),
                                         nn.Linear(hidden // 2, 1))
+        # offline trainer wants win-prob in [0,1] (sigmoid + BCE); PPO wants an
+        # unbounded value (returns can exceed 1 with reward shaping).
+        self.bounded_value = bounded_value
 
     def forward(self, x):
         x = self.stem(x)
         for b in self.blocks:
             x = b(x)
         logits = self.policy_head(x)
-        value = torch.sigmoid(self.value_head(x)).squeeze(-1)  # win probability in [0,1]
+        v = self.value_head(x).squeeze(-1)
+        value = torch.sigmoid(v) if self.bounded_value else v
         return logits, value
 
 
