@@ -4,8 +4,11 @@
 #SBATCH --error=crew_ppo_%j.err
 #SBATCH --account=gts-aa23         # Phoenix charge account (from pace-quota)
 #SBATCH --qos=embers               # free/backfill: runs on idle GPUs, preemptible
-#SBATCH --partition=gpu-v100       # 41 nodes (most available); fallback: gpu-rtx6000
-#SBATCH --gres=gpu:v100:1          # one idle V100
+# List several GPU partitions + a generic gres so the job lands on whichever GPU
+# frees up first. Our model is tiny, so any of these (>=16GB) fits batch 8192,
+# and the checkpoint is device-agnostic if chunks land on different GPU types.
+#SBATCH --partition=gpu-rtx6000,gpu-l40s,gpu-v100,gpu-h200,gpu-a100
+#SBATCH --gres=gpu:1               # one GPU of whatever type the partition has
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00            # embers walltime cap; resume spans multiple chunks
