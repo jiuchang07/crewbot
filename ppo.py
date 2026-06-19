@@ -33,7 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import crew_engine as E
-from train import PolicyValueNet, make_greedy_fn, evaluate
+from train import PolicyValueNet
 from vec_engine import VecCrew, N_P, TOTAL_TRICKS
 
 # ---------------------------------------------------------------------------
@@ -176,14 +176,36 @@ def ppo_update(model, opt, data):
     return {k: (v / nb if k != "nb" else v) for k, v in stats.items()}
 
 
+@torch.no_grad()
+def vec_evaluate(model, games_per_mission, device, seed=12345):
+    """Fast batched greedy win-rate over all 50 missions, on the vectorized
+    engine (proven identical to the scalar metric by test_vec_consistency.py).
+    Replaces the slow per-decision scalar eval — seconds instead of minutes."""
+    model.eval()
+    rng = np.random.default_rng(seed)
+    mids = np.repeat(np.arange(1, 51), games_per_mission)
+    vec = VecCrew.new_games(len(mids), mids, rng, device=device)
+    for _ in range(MAX_PLIES):
+        logits, _ = model(vec.observe())
+        logits = logits.masked_fill(~vec.legal_mask(), float("-inf"))
+        vec.step(logits.argmax(dim=-1))
+    succ = vec.success.cpu().numpy()
+    per = {m: float(succ[mids == m].mean()) for m in E.ALL_MISSIONS}
+    model.train()
+    return float(succ.mean()), per
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=30.0)
     ap.add_argument("--iters", type=int, default=0, help="if >0, overrides --minutes")
     ap.add_argument("--batch", type=int, default=BATCH)
-    ap.add_argument("--eval-games", type=int, default=40)
-    ap.add_argument("--eval-every", type=int, default=20)
+    ap.add_argument("--eval-games", type=int, default=100)
+    ap.add_argument("--eval-every", type=int, default=25)
+    ap.add_argument("--ckpt-every", type=int, default=25, help="iters between resume checkpoints")
+    ap.add_argument("--resume", action="store_true", help="resume from --state if it exists")
     ap.add_argument("--out", type=str, default=os.path.join(E.CACHE_DIR, "ppo_model.pt"))
+    ap.add_argument("--state", type=str, default=os.path.join(E.CACHE_DIR, "ppo_state.pt"))
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -196,11 +218,27 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params:,}")
 
-    level = START_LEVEL
-    roll_wr = 0.0
-    best_eval = -1.0
+    level, roll_wr, best_eval, it = START_LEVEL, 0.0, -1.0, 0
+
+    # Resume from a checkpoint if asked (essential on preemptible/backfill GPUs).
+    if args.resume and os.path.exists(args.state):
+        ck = torch.load(args.state, map_location=DEVICE)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        level, roll_wr, best_eval, it = ck["level"], ck["roll_wr"], ck["best_eval"], ck["it"]
+        torch.set_rng_state(ck["torch_rng"].cpu().to(torch.uint8))  # must be CPU ByteTensor
+        rng.bit_generator.state = ck["np_rng"]
+        print(f"RESUMED from {args.state}: it={it}, level={level}, best_eval={best_eval:.4f}")
+
+    os.makedirs(E.CACHE_DIR, exist_ok=True)
+
+    def save_state():
+        tmp = args.state + ".tmp"
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "level": level, "roll_wr": roll_wr, "best_eval": best_eval, "it": it,
+                    "torch_rng": torch.get_rng_state(), "np_rng": rng.bit_generator.state}, tmp)
+        os.replace(tmp, args.state)   # atomic: a crash mid-write can't corrupt it
+
     t0 = time.time()
-    it = 0
     while True:
         if args.iters > 0:
             if it >= args.iters:
@@ -223,7 +261,7 @@ def main():
                   f"kl {st['kl']:+.4f} | {(time.time()-t0)/60:.1f}m", flush=True)
 
         if args.eval_every and it > 0 and it % args.eval_every == 0:
-            overall, per = evaluate(model, args.eval_games)
+            overall, per = vec_evaluate(model, args.eval_games, DEVICE)
             cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
             print(f"  [eval] win_rate {overall:.4f} | mission_level "
                   f"{max(cleared) if cleared else 0} | level {level}", flush=True)
@@ -231,10 +269,13 @@ def main():
                 best_eval = overall
                 os.makedirs(os.path.dirname(args.out), exist_ok=True)
                 torch.save(model.state_dict(), args.out)
+        if args.ckpt_every and it > 0 and it % args.ckpt_every == 0:
+            save_state()
         it += 1
 
+    save_state()
     # final eval (the reported metric)
-    overall, per = evaluate(model, args.eval_games)
+    overall, per = vec_evaluate(model, args.eval_games, DEVICE)
     cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
     if overall > best_eval:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
