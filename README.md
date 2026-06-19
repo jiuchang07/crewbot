@@ -96,7 +96,29 @@ for data-gen, and the GPU is for training. If you *do* want the GPU busy during
 generation, use `vec_selfplay.py`, which batches thousands of games so each step
 is one big GPU forward pass — that's the only way a GPU helps here.
 
-## The learning approach
+## Training: on-policy PPO (primary)
+
+The main trainer is **`ppo.py`** — on-policy PPO self-play. Every iteration it
+generates fresh rollouts with the *current* policy (batched on the GPU via
+`vec_engine`) and updates with the clipped PPO objective. Generation and training
+are one loop, so there's **no separate data-gen step and no fixed dataset** — the
+data improves as the policy does, which is how the bot surpasses the heuristic.
+
+```bash
+python ppo.py --minutes 30          # local
+sbatch ppo.sbatch                   # PACE: one GPU, full budget
+```
+
+Design for The Crew's cooperative, sparse-reward setting: one shared policy plays
+all 3 seats; **reward shaping** gives partial credit per completed task; a
+**difficulty curriculum** trains on missions `1..level` and raises `level` as the
+win rate clears a threshold. In an 18-min local run this took `win_rate`
+0.055 → 0.159 and `mission_level` 3 → 10, still climbing.
+
+`train.py` (offline behavior-cloning on a frozen `selfplay.py` dataset) remains
+as an optional fast bootstrap, but its ceiling is the heuristic.
+
+## The learning approach (offline path)
 
 - **Reward**: shared team outcome — `1.0` if the mission is completed, else `0.0`
   (cooperative game, so all players share it).
