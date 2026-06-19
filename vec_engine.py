@@ -37,51 +37,54 @@ class VecCrew:
     # ------------------------------------------------------------------ resets
     @classmethod
     def from_scalar(cls, states, device="cpu"):
-        """Build a batch from a list of crew_engine.GameState (for testing)."""
+        """Build a batch from a list of crew_engine.GameState.
+
+        Assembles everything in NumPy first, then transfers each field to the
+        device in ONE shot. (Per-element writes into CUDA tensors here were the
+        dominant cost of self-play resets — ~80k tiny kernel launches per batch.)
+        """
         B = len(states)
-        color, rank, trump = (_COLOR.to(device), _RANK.to(device), _TRUMP.to(device))
-        self = cls(B, device, color, rank, trump)
-        self.owner = torch.full((B, N_C), -1, dtype=torch.long, device=device)
-        self.assigned = torch.full((B, N_C), -1, dtype=torch.long, device=device)
-        self.order_pos = torch.zeros((B, N_C), dtype=torch.long, device=device)
-        self.done_tasks = torch.zeros((B, N_C), dtype=torch.bool, device=device)
-        self.captured_by = torch.full((B, N_C), -1, dtype=torch.long, device=device)
-        self.table = torch.full((B, N_P), -1, dtype=torch.long, device=device)
-        self.comm_card = torch.full((B, N_P), -1, dtype=torch.long, device=device)
-        self.comm_type = torch.full((B, N_P), -1, dtype=torch.long, device=device)
-        self.comm_valid = torch.zeros((B, N_P), dtype=torch.bool, device=device)
-        self.led = torch.full((B,), -1, dtype=torch.long, device=device)
-        self.leader = torch.zeros((B,), dtype=torch.long, device=device)
-        self.turn = torch.zeros((B,), dtype=torch.long, device=device)
-        self.plays = torch.zeros((B,), dtype=torch.long, device=device)
-        self.tricks = torch.zeros((B,), dtype=torch.long, device=device)
-        self.done = torch.zeros((B,), dtype=torch.bool, device=device)
-        self.success = torch.zeros((B,), dtype=torch.bool, device=device)
-        self.failed = torch.zeros((B,), dtype=torch.bool, device=device)
+        owner = np.full((B, N_C), -1, np.int64)
+        assigned = np.full((B, N_C), -1, np.int64)
+        order_pos = np.zeros((B, N_C), np.int64)
+        done_tasks = np.zeros((B, N_C), bool)
+        captured = np.full((B, N_C), -1, np.int64)
+        table = np.full((B, N_P), -1, np.int64)
+        comm_card = np.full((B, N_P), -1, np.int64)
+        comm_type = np.full((B, N_P), -1, np.int64)
+        comm_valid = np.zeros((B, N_P), bool)
+        led = np.full(B, -1, np.int64)
+        leader = np.zeros(B, np.int64); turn = np.zeros(B, np.int64)
+        plays = np.zeros(B, np.int64); tricks = np.zeros(B, np.int64)
+        done = np.zeros(B, bool); success = np.zeros(B, bool); failed = np.zeros(B, bool)
         for b, s in enumerate(states):
             for p in range(N_P):
                 for c in s.hands[p]:
-                    self.owner[b, c] = p
-            self.assigned[b] = torch.tensor(s.assigned, device=device)
-            self.order_pos[b] = torch.tensor(s.order_pos, device=device)
+                    owner[b, c] = p
+            assigned[b] = s.assigned
+            order_pos[b] = s.order_pos
             for c in s.done_tasks:
-                self.done_tasks[b, c] = True
-            self.captured_by[b] = torch.tensor(s.captured_by, device=device)
+                done_tasks[b, c] = True
+            captured[b] = s.captured_by
             for j, (pl, c) in enumerate(s.on_table):
-                self.table[b, j] = c
-            self.plays[b] = len(s.on_table)
+                table[b, j] = c
+            plays[b] = len(s.on_table)
             for p in range(N_P):
                 card, htype, valid = s.comm[p]
-                self.comm_card[b, p] = card
-                self.comm_type[b, p] = htype
-                self.comm_valid[b, p] = bool(valid)
-            self.led[b] = s.led_color
-            self.leader[b] = s.leader
-            self.turn[b] = s.turn
-            self.tricks[b] = s.tricks_played
-            self.done[b] = s.done
-            self.success[b] = s.success
-            self.failed[b] = s.failed
+                comm_card[b, p] = card; comm_type[b, p] = htype; comm_valid[b, p] = bool(valid)
+            led[b] = s.led_color; leader[b] = s.leader; turn[b] = s.turn
+            tricks[b] = s.tricks_played
+            done[b] = s.done; success[b] = s.success; failed[b] = s.failed
+
+        color, rank, trump = (_COLOR.to(device), _RANK.to(device), _TRUMP.to(device))
+        self = cls(B, device, color, rank, trump)
+        t = lambda a: torch.from_numpy(a).to(device)
+        self.owner = t(owner); self.assigned = t(assigned); self.order_pos = t(order_pos)
+        self.done_tasks = t(done_tasks); self.captured_by = t(captured); self.table = t(table)
+        self.comm_card = t(comm_card); self.comm_type = t(comm_type); self.comm_valid = t(comm_valid)
+        self.led = t(led); self.leader = t(leader); self.turn = t(turn)
+        self.plays = t(plays); self.tricks = t(tricks)
+        self.done = t(done); self.success = t(success); self.failed = t(failed)
         return self
 
     @classmethod
