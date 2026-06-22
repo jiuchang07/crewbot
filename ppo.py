@@ -61,7 +61,7 @@ LEVEL_STEP = 2
 # missions, so a high bar would stall the curriculum forever.
 UP_THRESHOLD = 0.50
 
-MAX_PLIES = TOTAL_TRICKS * N_P
+MAX_PLIES = E.MAX_PLIES   # plays + communications (comm actions don't advance turn)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

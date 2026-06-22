@@ -22,7 +22,7 @@ def run(K=256, seed=0, atol=1e-5):
     vec = VecCrew.from_scalar(states, device="cpu")
 
     pick_rng = np.random.default_rng(seed + 999)
-    max_plies = TOTAL_TRICKS * N_P
+    max_plies = E.MAX_PLIES   # plays + communications
     obs_checked = 0
 
     for ply in range(max_plies):

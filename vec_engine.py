@@ -4,12 +4,13 @@ Vectorized (batched) Crew environment for GPU self-play.
 This steps B independent games in lockstep as tensors so that policy inference
 AND environment transitions are batched on the GPU — the only way a GPU helps
 self-play for a 40-card game. It reproduces crew_engine.py EXACTLY (verified by
-test_vec_consistency.py): same legal moves, trick resolution, task/order logic,
-rewards, and observation encoding (same 503-dim layout, block for block).
+test_vec_consistency.py): same legal moves (play + communicate), trick
+resolution, task/order logic, rewards, and observation encoding (block for
+block, OBS_DIM/ACT_DIM read from crew_engine).
 
 State is a bag of tensors of shape [B, ...]. All games run for a fixed
-TOTAL_TRICKS*N_PLAYERS plies; finished games are masked out (no-ops) until the
-wave ends.
+E.MAX_PLIES plies (plays + communications); finished games are masked out
+(no-ops) until the wave ends.
 """
 
 import numpy as np
@@ -53,6 +54,7 @@ class VecCrew:
         comm_card = np.full((B, N_P), -1, np.int64)
         comm_type = np.full((B, N_P), -1, np.int64)
         comm_valid = np.zeros((B, N_P), bool)
+        comm_used = np.zeros((B, N_P), bool)
         led = np.full(B, -1, np.int64)
         leader = np.zeros(B, np.int64); turn = np.zeros(B, np.int64)
         plays = np.zeros(B, np.int64); tricks = np.zeros(B, np.int64)
@@ -72,6 +74,7 @@ class VecCrew:
             for p in range(N_P):
                 card, htype, valid = s.comm[p]
                 comm_card[b, p] = card; comm_type[b, p] = htype; comm_valid[b, p] = bool(valid)
+                comm_used[b, p] = bool(s.comm_used[p])
             led[b] = s.led_color; leader[b] = s.leader; turn[b] = s.turn
             tricks[b] = s.tricks_played
             done[b] = s.done; success[b] = s.success; failed[b] = s.failed
@@ -82,6 +85,7 @@ class VecCrew:
         self.owner = t(owner); self.assigned = t(assigned); self.order_pos = t(order_pos)
         self.done_tasks = t(done_tasks); self.captured_by = t(captured); self.table = t(table)
         self.comm_card = t(comm_card); self.comm_type = t(comm_type); self.comm_valid = t(comm_valid)
+        self.comm_used = t(comm_used)
         self.led = t(led); self.leader = t(leader); self.turn = t(turn)
         self.plays = t(plays); self.tricks = t(tricks)
         self.done = t(done); self.success = t(success); self.failed = t(failed)
@@ -96,6 +100,33 @@ class VecCrew:
         return self
 
     # ------------------------------------------------------------------- moves
+    def _comm_table(self):
+        """Per current player: (comm_legal [B,N_C] bool, comm_type [B,N_C] long).
+        Mirrors crew_engine.communicable: only/highest/lowest non-trump card."""
+        B, dev = self.B, self.device
+        hand = self.owner == self.turn[:, None]                    # [B,N_C]
+        comm_legal = torch.zeros((B, N_C), dtype=torch.bool, device=dev)
+        comm_type = torch.zeros((B, N_C), dtype=torch.long, device=dev)
+        rpc = E.RANKS_PER_COLOR
+        for col in range(E.N_COLORS):
+            lo, hi = col * rpc, col * rpc + rpc
+            in_col = hand[:, lo:hi]                                # [B,rpc]
+            ranks = self.RANK[lo:hi]                               # [rpc] = 1..9
+            cnt = in_col.sum(dim=1, keepdim=True)                  # [B,1]
+            big = torch.where(in_col, ranks[None, :], torch.zeros_like(ranks)[None, :])
+            small = torch.where(in_col, ranks[None, :], torch.full_like(ranks, 99)[None, :])
+            maxr = big.max(dim=1, keepdim=True).values
+            minr = small.min(dim=1, keepdim=True).values
+            only = in_col & (cnt == 1)
+            ishigh = in_col & (cnt >= 2) & (ranks[None, :] == maxr)
+            islow = in_col & (cnt >= 2) & (ranks[None, :] == minr)
+            comm_legal[:, lo:hi] = only | ishigh | islow
+            comm_type[:, lo:hi] = ishigh.long() + 2 * islow.long()   # only -> 0
+        used = self.comm_used[self.arangeB, self.turn]             # [B] bool
+        comm_legal = comm_legal & (~used[:, None])
+        self._ctype_cache = comm_type   # reused by step() within the same ply
+        return comm_legal, comm_type
+
     def legal_mask(self):
         hand = self.owner == self.turn[:, None]                    # [B,N_C]
         leading = self.led == -1                                   # [B]
@@ -103,12 +134,16 @@ class VecCrew:
         follow = hand & same & (~leading[:, None])
         has_follow = follow.any(dim=1)                             # [B]
         use_follow = (~leading) & has_follow
-        legal = torch.where(use_follow[:, None], follow, hand)
+        play = torch.where(use_follow[:, None], follow, hand)      # [B,N_C]
+        comm_legal, _ = self._comm_table()
+        full = torch.zeros((self.B, 2 * N_C), dtype=torch.bool, device=self.device)
+        full[:, :N_C] = play
+        full[:, N_C:] = comm_legal
         # safety for finished games whose current player may be empty-handed
-        empty = ~legal.any(dim=1)
+        empty = ~full.any(dim=1)
         if empty.any():
-            legal[empty, 0] = True
-        return legal
+            full[empty, 0] = True
+        return full
 
     def _strength(self, cards):
         """Trick strength of cards [.. ] given each game's led color. cards: [B,K]."""
@@ -182,6 +217,10 @@ class VecCrew:
             type_oh[self.arangeB[mt], htype[mt]] = 1.0
             valid = self.comm_valid[self.arangeB, q].float()[:, None]
             blocks.append(card_oh); blocks.append(type_oh); blocks.append(valid)
+        # 11b communication token available, relative seating
+        avail = (~self.comm_used).float()
+        blocks.append(torch.stack([avail[self.arangeB, (turn + off) % N_P]
+                                   for off in range(N_P)], dim=1))
         # 12 relative hand sizes
         counts = torch.stack([(self.owner == p).sum(dim=1) for p in range(N_P)], dim=1).float()
         rel = torch.stack([counts[self.arangeB, (turn + off) % N_P] for off in range(N_P)], dim=1)
@@ -197,24 +236,41 @@ class VecCrew:
 
     # ------------------------------------------------------------------- step
     def step(self, actions):
-        """Apply actions [B] for all active games; resolve completed tricks."""
-        B, dev = self.B, self.device
+        """Apply actions [B] (play 0..N_C-1 or communicate N_C..2N_C-1) for all
+        active games; communications don't advance the turn, plays do."""
         active = ~self.done
-        a = actions
-        # place card: remove from hand, set led on first play, add to table
-        first = active & (self.plays == 0)
-        self.led = torch.where(first, self.COLOR[a], self.led)
-        # record on table at position = plays
-        idx = active.nonzero(as_tuple=True)[0]
-        self.table[idx, self.plays[idx]] = a[idx]
-        self.owner[idx, a[idx]] = -1
-        self.plays = torch.where(active, self.plays + 1, self.plays)
-        self.turn = torch.where(active, (self.turn + 1) % N_P, self.turn)
+        is_comm = active & (actions >= N_C)
+        is_play = active & (actions < N_C)
 
-        # resolve full tricks
-        resolve = active & (self.plays == N_P)
-        if resolve.any():
+        # --- communication: reveal card, spend token, no turn/trick change ---
+        if bool(is_comm.any()):
+            # reuse comm_type from the legal_mask() call earlier this ply if the
+            # state is unchanged; otherwise recompute.
+            ctype = getattr(self, "_ctype_cache", None)
+            if ctype is None:
+                _, ctype = self._comm_table()
+            ci = is_comm.nonzero(as_tuple=True)[0]
+            tp = self.turn[ci]
+            c = actions[ci] - N_C
+            self.comm_card[ci, tp] = c
+            self.comm_type[ci, tp] = ctype[ci, c]
+            self.comm_valid[ci, tp] = True
+            self.comm_used[ci, tp] = True
+
+        # --- play: place card, advance turn, maybe resolve the trick ---
+        safe_a = torch.where(actions < N_C, actions, torch.zeros_like(actions))
+        first = is_play & (self.plays == 0)
+        self.led = torch.where(first, self.COLOR[safe_a], self.led)
+        pidx = is_play.nonzero(as_tuple=True)[0]
+        self.table[pidx, self.plays[pidx]] = actions[pidx]
+        self.owner[pidx, actions[pidx]] = -1
+        self.plays = torch.where(is_play, self.plays + 1, self.plays)
+        self.turn = torch.where(is_play, (self.turn + 1) % N_P, self.turn)
+
+        resolve = is_play & (self.plays == N_P)
+        if bool(resolve.any()):
             self._resolve(resolve)
+        self._ctype_cache = None   # state changed: invalidate comm_type cache
         return self
 
     def _resolve(self, R):

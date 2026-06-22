@@ -43,6 +43,12 @@ CARDS_PER_PLAYER_MAX = (N_CARDS + N_PLAYERS - 1) // N_PLAYERS  # 14
 # captured -> that mission fails, which is correct game behavior.
 TOTAL_TRICKS = N_CARDS // N_PLAYERS               # 13
 
+# Action space: 0..39 play card c; 40..79 communicate card c (reveal it).
+COMM_OFFSET = N_CARDS                              # comm action id = COMM_OFFSET + card
+# A communicate action does not advance the turn, so a game has at most
+# TOTAL_TRICKS*N_PLAYERS plays + N_PLAYERS communications. +1 cushion.
+MAX_PLIES = TOTAL_TRICKS * N_PLAYERS + N_PLAYERS + 1
+
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "crewbot")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 
@@ -159,36 +165,33 @@ class GameState:
     leader: int                     # player who leads current trick
     turn: int                       # current player to act
     comm: list                      # per player: (card, type, valid); type 0=only,1=high,2=low
+    comm_used: list                 # per player: bool, communication token spent
     tricks_played: int
+    allow_comm: bool = True         # if False, communication actions are disabled
     done: bool = False
     success: bool = False
     failed: bool = False
 
 # ---------------------------------------------------------------------------
-# Communication (simplified): each player reveals one legal non-trump card.
-# Rule (real game): you may reveal a card that is your only / highest / lowest
-# of its color. We auto-pick one such card per player via a fixed heuristic so
-# the cooperative information is present in the observation.
+# Communication (real rule): each player has ONE token. They may reveal one card
+# that is their only / highest / lowest of its color (no trumps). The policy
+# chooses WHICH card and WHEN; the signal type below is derived from the hand.
+# type: 0=only, 1=highest, 2=lowest
 # ---------------------------------------------------------------------------
 
-def _auto_communication(hand, rng):
-    by_color = {col: sorted([c for c in hand if card_color(c) == col], key=card_rank)
-                for col in range(N_COLORS)}
-    candidates = []  # (card, type) where type 0=only,1=high,2=low
-    for col, cards in by_color.items():
+def communicable(hand):
+    """Return {card: type} for every card the player may legally reveal now."""
+    out = {}
+    for col in range(N_COLORS):
+        cards = sorted((c for c in hand if card_color(c) == col), key=card_rank)
         if not cards:
             continue
         if len(cards) == 1:
-            candidates.append((cards[0], 0))
+            out[cards[0]] = 0          # only card of its color
         else:
-            candidates.append((cards[-1], 1))
-            candidates.append((cards[0], 2))
-    if not candidates:
-        return (-1, -1, 0)  # only trumps in hand -> nothing to communicate
-    # prefer revealing an "only" card (highest information), else random
-    onlys = [c for c in candidates if c[1] == 0]
-    pick = onlys[rng.integers(len(onlys))] if onlys else candidates[rng.integers(len(candidates))]
-    return (int(pick[0]), int(pick[1]), 1)
+            out[cards[-1]] = 1         # highest of its color
+            out[cards[0]] = 2          # lowest of its color
+    return out
 
 # ---------------------------------------------------------------------------
 # Game lifecycle
@@ -213,8 +216,9 @@ def new_game(rng, mission_id, use_comm=True):
     for i, c in enumerate(mission.order):
         order_pos[c] = i + 1
 
-    comm = [_auto_communication(hands[p], rng) if use_comm else (-1, -1, 0)
-            for p in range(N_PLAYERS)]
+    # Communication starts empty: players decide what/whether to signal in-game.
+    comm = [(-1, -1, 0) for _ in range(N_PLAYERS)]
+    comm_used = [not use_comm for _ in range(N_PLAYERS)]  # disabled => token "spent"
 
     # Commander = holder of the highest trump (rocket 4) leads the first trick.
     leader = next(p for p in range(N_PLAYERS) if 39 in hands[p])
@@ -223,21 +227,39 @@ def new_game(rng, mission_id, use_comm=True):
         hands=hands, mission=mission, assigned=assigned, order_pos=order_pos,
         done_tasks=set(), captured_by=np.full(N_CARDS, -1, dtype=np.int64),
         on_table=[], led_color=-1, leader=leader, turn=leader, comm=comm,
-        tricks_played=0,
+        comm_used=comm_used, tricks_played=0, allow_comm=use_comm,
     )
 
 def legal_actions(s):
     hand = s.hands[s.turn]
     if s.led_color == -1:
-        return sorted(hand)
-    follow = [c for c in hand if card_color(c) == s.led_color]
-    return sorted(follow) if follow else sorted(hand)
+        plays = sorted(hand)
+    else:
+        follow = [c for c in hand if card_color(c) == s.led_color]
+        plays = sorted(follow) if follow else sorted(hand)
+    # Communication actions: legal before any of your plays while the token is
+    # unused. Available regardless of led color (it's not a play into the trick).
+    if not s.comm_used[s.turn]:
+        plays = plays + [COMM_OFFSET + c for c in sorted(communicable(hand))]
+    return plays
 
 def step(s, action):
-    """Play `action` for the current player. Mutates and returns s."""
+    """Apply `action` (play 0..39 or communicate 40..79) for the current player."""
     assert not s.done
-    assert action in s.hands[s.turn], f"illegal action {card_name(action)}"
     p = s.turn
+
+    # --- Communication action: reveal a card, spend token, do NOT advance turn.
+    if action >= COMM_OFFSET:
+        c = action - COMM_OFFSET
+        assert not s.comm_used[p], "communication token already used"
+        types = communicable(s.hands[p])
+        assert c in types, f"illegal communication {card_name(c)}"
+        s.comm[p] = (int(c), int(types[c]), 1)
+        s.comm_used[p] = True
+        return s
+
+    # --- Play action.
+    assert action in s.hands[s.turn], f"illegal action {card_name(action)}"
     s.hands[p].discard(action)
     if not s.on_table:
         s.led_color = card_color(action)
@@ -362,6 +384,10 @@ def observe(s, player=None):
         blocks.append(_onehot(htype, 3))
         blocks.append(np.array([float(valid)], dtype=np.float32))
 
+    # 11b. communication token still available, relative seating
+    blocks.append(np.array([0.0 if s.comm_used[(p + off) % N_PLAYERS] else 1.0
+                            for off in range(N_PLAYERS)], dtype=np.float32))
+
     # 12. relative hand sizes
     blocks.append(np.array([len(s.hands[(p + off) % N_PLAYERS]) / CARDS_PER_PLAYER_MAX
                             for off in range(N_PLAYERS)], dtype=np.float32))
@@ -376,14 +402,16 @@ def observe(s, player=None):
     return np.concatenate(blocks)
 
 def legal_mask(s):
-    m = np.zeros(N_CARDS, dtype=np.float32)
-    for c in legal_actions(s):
-        m[c] = 1.0
+    m = np.zeros(ACT_DIM, dtype=np.float32)
+    for a in legal_actions(s):
+        m[a] = 1.0
     return m
+
+# Action space: 40 play + 40 communicate.
+ACT_DIM = 2 * N_CARDS
 
 # Compute OBS_DIM once from a sample game.
 OBS_DIM = observe(new_game(np.random.default_rng(0), 1)).shape[0]
-ACT_DIM = N_CARDS
 
 # ---------------------------------------------------------------------------
 # Heuristic policy (for bootstrapping self-play data; no neural net needed)
@@ -394,8 +422,9 @@ def _open_task(s, c):
 
 def heuristic_action(s, rng, epsilon=0.1):
     """Cooperative heuristic: deliver task cards to their assignee, otherwise
-    duck. Far from optimal, but gives self-play data real signal."""
-    legal = legal_actions(s)
+    duck. Far from optimal, but gives self-play data real signal. Plays only
+    (never communicates), so it considers play actions exclusively."""
+    legal = [a for a in legal_actions(s) if a < COMM_OFFSET]
     if rng.random() < epsilon:
         return int(legal[rng.integers(len(legal))])
 

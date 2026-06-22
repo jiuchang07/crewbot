@@ -54,7 +54,7 @@ def main():
     print(f"Vec self-play: device={device}, batch={args.batch}, budget={args.hours}h")
     deadline = time.time() + args.hours * 3600
     B = args.batch
-    max_plies = TOTAL_TRICKS * N_P
+    max_plies = E.MAX_PLIES
 
     total_dec = 0
     total_games = 0

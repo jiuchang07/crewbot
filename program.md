@@ -51,6 +51,12 @@ are ground truth). Do not change the win condition, the 3-player rules, or the
 observation contract. Do not modify `vec_engine.py` without re-running
 `python test_vec_consistency.py` to prove it still matches the scalar engine.
 
+**Action space (80):** actions 0–39 play card c; actions 40–79 *communicate*
+card c (the real Crew token). A communicate action is legal only while the
+player's token is unused and c is their only/highest/lowest of its color; it
+reveals the card (type derived from the hand), spends the token, and does NOT
+advance the turn. The policy learns which card to signal and when.
+
 ## The metric
 
 `train.py` prints a summary ending with:
