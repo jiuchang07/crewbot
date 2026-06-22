@@ -71,11 +71,11 @@ def build_ppo_model():
 
 
 @torch.no_grad()
-def rollout(model, rng, level, device, batch):
+def rollout(model, rng, level, device, batch, solvable_only=False):
     """Collect `batch` full self-play episodes under the current policy.
     Returns flat tensors over active decisions plus the rollout win rate."""
     mids = rng.integers(1, level + 1, size=batch)
-    vec = VecCrew.new_games(batch, mids, rng, device=device)
+    vec = VecCrew.new_games(batch, mids, rng, device=device, solvable_only=solvable_only)
     n_tasks = (vec.assigned >= 0).sum(dim=1).clamp(min=1).float()
 
     O, A, LP, V, LE, R, AC, TM = [], [], [], [], [], [], [], []
@@ -177,14 +177,14 @@ def ppo_update(model, opt, data):
 
 
 @torch.no_grad()
-def vec_evaluate(model, games_per_mission, device, seed=12345):
+def vec_evaluate(model, games_per_mission, device, seed=12345, solvable_only=False):
     """Fast batched greedy win-rate over all 50 missions, on the vectorized
     engine (proven identical to the scalar metric by test_vec_consistency.py).
     Replaces the slow per-decision scalar eval — seconds instead of minutes."""
     model.eval()
     rng = np.random.default_rng(seed)
     mids = np.repeat(np.arange(1, 51), games_per_mission)
-    vec = VecCrew.new_games(len(mids), mids, rng, device=device)
+    vec = VecCrew.new_games(len(mids), mids, rng, device=device, solvable_only=solvable_only)
     for _ in range(MAX_PLIES):
         logits, _ = model(vec.observe())
         logits = logits.masked_fill(~vec.legal_mask(), float("-inf"))
@@ -206,6 +206,8 @@ def main():
     ap.add_argument("--resume", action="store_true", help="resume from --state if it exists")
     ap.add_argument("--out", type=str, default=os.path.join(E.CACHE_DIR, "ppo_model.pt"))
     ap.add_argument("--state", type=str, default=os.path.join(E.CACHE_DIR, "ppo_state.pt"))
+    ap.add_argument("--solvable", action="store_true",
+                    help="train+eval on constructed solvable missions only")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -246,7 +248,7 @@ def main():
         elif time.time() - t0 >= args.minutes * 60:
             break
 
-        data, wr = rollout(model, rng, level, DEVICE, args.batch)
+        data, wr = rollout(model, rng, level, DEVICE, args.batch, solvable_only=args.solvable)
         st = ppo_update(model, opt, data)
         roll_wr = 0.9 * roll_wr + 0.1 * wr if it else wr
 
@@ -261,7 +263,7 @@ def main():
                   f"kl {st['kl']:+.4f} | {(time.time()-t0)/60:.1f}m", flush=True)
 
         if args.eval_every and it > 0 and it % args.eval_every == 0:
-            overall, per = vec_evaluate(model, args.eval_games, DEVICE)
+            overall, per = vec_evaluate(model, args.eval_games, DEVICE, solvable_only=args.solvable)
             cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
             print(f"  [eval] win_rate {overall:.4f} | mission_level "
                   f"{max(cleared) if cleared else 0} | level {level}", flush=True)
@@ -275,7 +277,7 @@ def main():
 
     save_state()
     # final eval (the reported metric)
-    overall, per = vec_evaluate(model, args.eval_games, DEVICE)
+    overall, per = vec_evaluate(model, args.eval_games, DEVICE, solvable_only=args.solvable)
     cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
     if overall > best_eval:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)

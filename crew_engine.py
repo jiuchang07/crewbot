@@ -152,6 +152,67 @@ def trick_winner(trick, led_color):
     return best_p
 
 # ---------------------------------------------------------------------------
+# Perfect-information cooperative solver: given all hands, is there a joint line
+# of play that completes every task (respecting assignment + ordering)? Used to
+# build a *solvable* mission distribution so win_rate measures skill on winnable
+# deals rather than being dragged down by impossible random assignments.
+# Backtracking DFS controlling all players, with a node cap (cap reached => treat
+# as unsolvable, which conservatively biases toward clearly-winnable missions).
+# ---------------------------------------------------------------------------
+
+def is_solvable(hands, assigned, order_pos, node_cap=4000):
+    tasks = [c for c in range(N_CARDS) if assigned[c] != -1]
+    n_tasks = len(tasks)
+    if n_tasks == 0:
+        return True
+    hands = [set(h) for h in hands]
+    leader0 = next(p for p in range(N_PLAYERS) if 39 in hands[p])
+    done = set()
+    nodes = [0]
+    order_cards = [c for c in range(N_CARDS) if order_pos[c] > 0]
+
+    def rec(on_table, led, turn, tricks_played):
+        if len(done) == n_tasks:
+            return True
+        if tricks_played >= TOTAL_TRICKS:
+            return False
+        nodes[0] += 1
+        if nodes[0] > node_cap:
+            return False
+        hand = hands[turn]
+        if not on_table:
+            legal = sorted(hand)
+        else:
+            follow = [c for c in hand if card_color(c) == led]
+            legal = sorted(follow) if follow else sorted(hand)
+        for a in legal:
+            hand.discard(a)
+            new_led = card_color(a) if not on_table else led
+            on_table.append((turn, a))
+            if len(on_table) < N_PLAYERS:
+                if rec(on_table, new_led, (turn + 1) % N_PLAYERS, tricks_played):
+                    hand.add(a); on_table.pop(); return True
+            else:
+                winner = trick_winner(on_table, new_led)
+                ok, added = True, []
+                for _, c in on_table:                  # play order, matches step()
+                    if assigned[c] != -1:
+                        if winner != assigned[c]:
+                            ok = False; break
+                        op = order_pos[c]
+                        if op > 0 and not all(d in done for d in order_cards if 0 < order_pos[d] < op):
+                            ok = False; break
+                        done.add(c); added.append(c)
+                if ok and rec([], -1, winner, tricks_played + 1):
+                    for c in added: done.discard(c)
+                    hand.add(a); on_table.pop(); return True
+                for c in added: done.discard(c)
+            hand.add(a); on_table.pop()
+        return False
+
+    return rec([], -1, leader0, 0)
+
+# ---------------------------------------------------------------------------
 # Game state
 # ---------------------------------------------------------------------------
 
@@ -200,24 +261,77 @@ def communicable(hand):
 # Game lifecycle
 # ---------------------------------------------------------------------------
 
-def new_game(rng, mission_id, use_comm=True):
+def _deal(rng):
     deck = list(range(N_CARDS))
     rng.shuffle(deck)
-    # 3 players: 14/13/13, the extra card going to a random player
-    sizes = [13, 13, 13]
+    sizes = [13, 13, 13]            # 14/13/13, extra card to a random player
     sizes[rng.integers(N_PLAYERS)] += 1
     hands, idx = [], 0
     for sz in sizes:
         hands.append(set(deck[idx:idx + sz]))
         idx += sz
+    return hands
 
-    mission = sample_mission(rng, mission_id)
+def _mission_arrays(mission):
     assigned = np.full(N_CARDS, -1, dtype=np.int64)
     for c, p in mission.assign.items():
         assigned[c] = p
     order_pos = np.zeros(N_CARDS, dtype=np.int64)
     for i, c in enumerate(mission.order):
         order_pos[c] = i + 1
+    return assigned, order_pos
+
+def _playout_captures(rng, hands):
+    """Random-legal cooperative play-out. Returns captures as (trick_idx, winner,
+    card) in completion order (within a trick: in play order)."""
+    hands = [set(h) for h in hands]
+    turn = next(p for p in range(N_PLAYERS) if 39 in hands[p])
+    on_table, led, captures, trick_idx = [], -1, [], 0
+    for _ in range(TOTAL_TRICKS * N_PLAYERS):       # 39 plays
+        hand = hands[turn]
+        if not on_table:
+            legal = sorted(hand)
+        else:
+            follow = [c for c in hand if card_color(c) == led]
+            legal = sorted(follow) if follow else sorted(hand)
+        a = int(legal[rng.integers(len(legal))])
+        hand.discard(a)
+        if not on_table:
+            led = card_color(a)
+        on_table.append((turn, a))
+        if len(on_table) < N_PLAYERS:
+            turn = (turn + 1) % N_PLAYERS
+        else:
+            w = trick_winner(on_table, led)
+            for _, c in on_table:
+                captures.append((trick_idx, w, c))
+            on_table, led, turn, trick_idx = [], -1, w, trick_idx + 1
+    return captures
+
+def construct_solvable_mission(rng, hands, mission_id):
+    """Build a guaranteed-winnable mission: play a cooperative line, then assign
+    chosen captured (non-trump) cards to whoever captured them, in completion
+    order. The recorded line is itself a solution, so the mission is solvable."""
+    num_tasks, ordered = MISSIONS[mission_id]
+    caps = _playout_captures(rng, hands)
+    cand = [(ti, w, c) for (ti, w, c) in caps if not is_trump(c)]
+    num_tasks = min(num_tasks, len(cand))
+    chosen = sorted(rng.choice(len(cand), size=num_tasks, replace=False))
+    sel = [cand[i] for i in chosen]                 # preserves (trick, play-order)
+    assign = {int(c): int(w) for (ti, w, c) in sel}
+    order = [int(c) for (ti, w, c) in sel] if (ordered and num_tasks >= 2) else []
+    return Mission(mission_id=mission_id, assign=assign, order=order)
+
+def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40):
+    hands = _deal(rng)
+    if solvable_only:
+        # Construct a winnable mission from a cooperative play-out (cheap, no
+        # search) so win_rate measures skill, not luck of a (often impossible)
+        # random task assignment.
+        mission = construct_solvable_mission(rng, hands, mission_id)
+    else:
+        mission = sample_mission(rng, mission_id)
+    assigned, order_pos = _mission_arrays(mission)
 
     # Communication starts empty; filled during the setup round (if enabled).
     comm = [(-1, -1, 0) for _ in range(N_PLAYERS)]
@@ -493,9 +607,9 @@ def _is_boss(s, c):
 # Evaluation metric (FIXED — this is the ground-truth win_rate)
 # ---------------------------------------------------------------------------
 
-def play_one(action_fn, rng, mission_id, use_comm=True, max_tricks=60):
+def play_one(action_fn, rng, mission_id, use_comm=True, max_tricks=60, solvable_only=False):
     """Play a full mission. action_fn(state)->card. Returns (success, n_steps)."""
-    s = new_game(rng, mission_id, use_comm=use_comm)
+    s = new_game(rng, mission_id, use_comm=use_comm, solvable_only=solvable_only)
     steps = 0
     while not s.done and steps < max_tricks * N_PLAYERS:
         a = action_fn(s)
@@ -506,8 +620,11 @@ def play_one(action_fn, rng, mission_id, use_comm=True, max_tricks=60):
         steps += 1
     return s.success, steps
 
-def evaluate_winrate(action_fn, missions=None, games_per_mission=200, seed=12345, use_comm=True):
+def evaluate_winrate(action_fn, missions=None, games_per_mission=200, seed=12345,
+                     use_comm=True, solvable_only=False):
     """Average mission success rate, the metric to maximize. Higher is better.
+    With solvable_only, missions are rejection-sampled to be winnable, so the
+    metric measures skill rather than luck of the deal.
 
     Returns (overall_win_rate, {mission_id: win_rate}).
     """
@@ -518,7 +635,7 @@ def evaluate_winrate(action_fn, missions=None, games_per_mission=200, seed=12345
     for m in missions:
         wins = 0
         for _ in range(games_per_mission):
-            ok, _ = play_one(action_fn, rng, m, use_comm=use_comm)
+            ok, _ = play_one(action_fn, rng, m, use_comm=use_comm, solvable_only=solvable_only)
             wins += int(ok)
         per[m] = wins / games_per_mission
         wins_total += wins

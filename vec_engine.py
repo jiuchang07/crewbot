@@ -92,12 +92,11 @@ class VecCrew:
         return self
 
     @classmethod
-    def new_games(cls, B, mission_ids, rng, device="cpu"):
+    def new_games(cls, B, mission_ids, rng, device="cpu", solvable_only=False):
         """Fresh batch. mission_ids: array-like length B. rng: np.random.Generator."""
-        color, rank, trump = (_COLOR.to(device), _RANK.to(device), _TRUMP.to(device))
-        states = [E.new_game(rng, int(mission_ids[b])) for b in range(B)]
-        self = cls.from_scalar(states, device=device)
-        return self
+        states = [E.new_game(rng, int(mission_ids[b]), solvable_only=solvable_only)
+                  for b in range(B)]
+        return cls.from_scalar(states, device=device)
 
     # ------------------------------------------------------------------- moves
     def _comm_table(self):
