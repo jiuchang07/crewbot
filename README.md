@@ -156,11 +156,12 @@ better.
 ## Scope / simplifications
 
 - Fixed at **3 players** (official 14/13/13 deal, 13 tricks, one leftover card).
-- **Communication** is the real Crew token, as a learned action: each player has
-  one token and the policy chooses which card to reveal (its only/highest/lowest
-  of a color) and when — or never. Actions 40–79 are the communicate actions; a
-  communication spends the token and doesn't advance the turn. (Set
-  `new_game(..., use_comm=False)` to ablate communication entirely.)
+- **Communication** is a learned action in a setup round before play: in turn
+  order from the leader, each player reveals one card (its only/highest/lowest of
+  a color) or passes — the policy decides what to signal, faithfully to The Crew
+  (truthful, one card per player, no trumps, no mid-trick signalling). Actions
+  0–39 play, 40–79 communicate, 80 = pass. (Set `new_game(..., use_comm=False)`
+  to ablate communication entirely.)
 - The 50-mission ladder is modeled as an increasing number of randomly-drawn
   task cards plus (back half) required completion ordering. A few campaign
   missions have special objective tokens (e.g. "win exactly N tricks"); these can

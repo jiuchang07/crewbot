@@ -43,11 +43,14 @@ CARDS_PER_PLAYER_MAX = (N_CARDS + N_PLAYERS - 1) // N_PLAYERS  # 14
 # captured -> that mission fails, which is correct game behavior.
 TOTAL_TRICKS = N_CARDS // N_PLAYERS               # 13
 
-# Action space: 0..39 play card c; 40..79 communicate card c (reveal it).
+# Action space: 0..39 play card c; 40..79 communicate card c; 80 = pass.
+# Communication happens only in a one-round setup phase at the start of the
+# game (before any trick): each player, in turn order from the leader, either
+# communicates one eligible card or passes. No mid-trick / per-trick comm.
 COMM_OFFSET = N_CARDS                              # comm action id = COMM_OFFSET + card
-# A communicate action does not advance the turn, so a game has at most
-# TOTAL_TRICKS*N_PLAYERS plays + N_PLAYERS communications. +1 cushion.
-MAX_PLIES = TOTAL_TRICKS * N_PLAYERS + N_PLAYERS + 1
+PASS_ACTION = 2 * N_CARDS                          # decline to communicate (80)
+# A game = N_PLAYERS comm-phase decisions + TOTAL_TRICKS*N_PLAYERS plays. +1 cushion.
+MAX_PLIES = N_PLAYERS + TOTAL_TRICKS * N_PLAYERS + 1
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "crewbot")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
@@ -165,18 +168,18 @@ class GameState:
     leader: int                     # player who leads current trick
     turn: int                       # current player to act
     comm: list                      # per player: (card, type, valid); type 0=only,1=high,2=low
-    comm_used: list                 # per player: bool, communication token spent
+    comm_phase: bool                # True during the start-of-game communication round
+    comm_count: int                 # players who have made their comm-phase decision
     tricks_played: int
-    allow_comm: bool = True         # if False, communication actions are disabled
     done: bool = False
     success: bool = False
     failed: bool = False
 
 # ---------------------------------------------------------------------------
-# Communication (real rule): each player has ONE token. They may reveal one card
-# that is their only / highest / lowest of its color (no trumps). The policy
-# chooses WHICH card and WHEN; the signal type below is derived from the hand.
-# type: 0=only, 1=highest, 2=lowest
+# Communication (real rule): each player may reveal one card that is their only
+# / highest / lowest of its color (no trumps), during a setup round before play.
+# The policy chooses WHICH card (or to pass); the signal type below is derived
+# from the hand. type: 0=only, 1=highest, 2=lowest
 # ---------------------------------------------------------------------------
 
 def communicable(hand):
@@ -216,51 +219,57 @@ def new_game(rng, mission_id, use_comm=True):
     for i, c in enumerate(mission.order):
         order_pos[c] = i + 1
 
-    # Communication starts empty: players decide what/whether to signal in-game.
+    # Communication starts empty; filled during the setup round (if enabled).
     comm = [(-1, -1, 0) for _ in range(N_PLAYERS)]
-    comm_used = [not use_comm for _ in range(N_PLAYERS)]  # disabled => token "spent"
 
-    # Commander = holder of the highest trump (rocket 4) leads the first trick.
+    # Commander = holder of the highest trump (rocket 4) leads the first trick
+    # and decides first in the communication round.
     leader = next(p for p in range(N_PLAYERS) if 39 in hands[p])
 
     return GameState(
         hands=hands, mission=mission, assigned=assigned, order_pos=order_pos,
         done_tasks=set(), captured_by=np.full(N_CARDS, -1, dtype=np.int64),
         on_table=[], led_color=-1, leader=leader, turn=leader, comm=comm,
-        comm_used=comm_used, tricks_played=0, allow_comm=use_comm,
+        comm_phase=bool(use_comm), comm_count=0, tricks_played=0,
     )
 
 def legal_actions(s):
+    # Setup communication round: pass, or reveal one eligible card.
+    if s.comm_phase:
+        return [PASS_ACTION] + [COMM_OFFSET + c for c in sorted(communicable(s.hands[s.turn]))]
+    # Trick play.
     hand = s.hands[s.turn]
     if s.led_color == -1:
-        plays = sorted(hand)
-    else:
-        follow = [c for c in hand if card_color(c) == s.led_color]
-        plays = sorted(follow) if follow else sorted(hand)
-    # Communication actions: legal before any of your plays while the token is
-    # unused. Available regardless of led color (it's not a play into the trick).
-    if not s.comm_used[s.turn]:
-        plays = plays + [COMM_OFFSET + c for c in sorted(communicable(hand))]
-    return plays
+        return sorted(hand)
+    follow = [c for c in hand if card_color(c) == s.led_color]
+    return sorted(follow) if follow else sorted(hand)
 
 def step(s, action):
-    """Apply `action` (play 0..39 or communicate 40..79) for the current player."""
+    """Apply `action`: during the comm phase a pass (80) or communicate (40..79);
+    otherwise a play (0..39)."""
     assert not s.done
     p = s.turn
 
-    # --- Communication action: reveal a card, spend token, do NOT advance turn.
-    if action >= COMM_OFFSET:
-        c = action - COMM_OFFSET
-        assert not s.comm_used[p], "communication token already used"
-        types = communicable(s.hands[p])
-        assert c in types, f"illegal communication {card_name(c)}"
-        s.comm[p] = (int(c), int(types[c]), 1)
-        s.comm_used[p] = True
+    # --- Communication round: each player decides once, in order from leader.
+    if s.comm_phase:
+        if action != PASS_ACTION:
+            c = action - COMM_OFFSET
+            types = communicable(s.hands[p])
+            assert c in types, f"illegal communication {card_name(c)}"
+            s.comm[p] = (int(c), int(types[c]), 1)
+        s.comm_count += 1
+        if s.comm_count >= N_PLAYERS:
+            s.comm_phase = False
+            s.turn = s.leader
+        else:
+            s.turn = (s.leader + s.comm_count) % N_PLAYERS
         return s
 
     # --- Play action.
     assert action in s.hands[s.turn], f"illegal action {card_name(action)}"
     s.hands[p].discard(action)
+    if s.comm[p][0] == action:
+        s.comm[p] = (-1, -1, 0)   # signal consumed once its card is played (#3)
     if not s.on_table:
         s.led_color = card_color(action)
     s.on_table.append((p, action))
@@ -384,19 +393,16 @@ def observe(s, player=None):
         blocks.append(_onehot(htype, 3))
         blocks.append(np.array([float(valid)], dtype=np.float32))
 
-    # 11b. communication token still available, relative seating
-    blocks.append(np.array([0.0 if s.comm_used[(p + off) % N_PLAYERS] else 1.0
-                            for off in range(N_PLAYERS)], dtype=np.float32))
-
     # 12. relative hand sizes
     blocks.append(np.array([len(s.hands[(p + off) % N_PLAYERS]) / CARDS_PER_PLAYER_MAX
                             for off in range(N_PLAYERS)], dtype=np.float32))
 
-    # 13. scalars
+    # 13. scalars (incl. communication-phase flag so the policy knows the phase)
     blocks.append(np.array([
         s.tricks_played / TOTAL_TRICKS,
         1.0 if s.turn == s.leader else 0.0,
         len(s.on_table) / N_PLAYERS,
+        1.0 if s.comm_phase else 0.0,
     ], dtype=np.float32))
 
     return np.concatenate(blocks)
@@ -407,8 +413,8 @@ def legal_mask(s):
         m[a] = 1.0
     return m
 
-# Action space: 40 play + 40 communicate.
-ACT_DIM = 2 * N_CARDS
+# Action space: 40 play + 40 communicate + 1 pass.
+ACT_DIM = 2 * N_CARDS + 1
 
 # Compute OBS_DIM once from a sample game.
 OBS_DIM = observe(new_game(np.random.default_rng(0), 1)).shape[0]
@@ -422,8 +428,10 @@ def _open_task(s, c):
 
 def heuristic_action(s, rng, epsilon=0.1):
     """Cooperative heuristic: deliver task cards to their assignee, otherwise
-    duck. Far from optimal, but gives self-play data real signal. Plays only
-    (never communicates), so it considers play actions exclusively."""
+    duck. Far from optimal, but gives self-play data real signal. Never
+    communicates: passes in the comm phase and plays cards otherwise."""
+    if s.comm_phase:
+        return PASS_ACTION
     legal = [a for a in legal_actions(s) if a < COMM_OFFSET]
     if rng.random() < epsilon:
         return int(legal[rng.integers(len(legal))])

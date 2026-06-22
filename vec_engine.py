@@ -54,7 +54,7 @@ class VecCrew:
         comm_card = np.full((B, N_P), -1, np.int64)
         comm_type = np.full((B, N_P), -1, np.int64)
         comm_valid = np.zeros((B, N_P), bool)
-        comm_used = np.zeros((B, N_P), bool)
+        comm_phase = np.zeros(B, bool); comm_count = np.zeros(B, np.int64)
         led = np.full(B, -1, np.int64)
         leader = np.zeros(B, np.int64); turn = np.zeros(B, np.int64)
         plays = np.zeros(B, np.int64); tricks = np.zeros(B, np.int64)
@@ -74,7 +74,7 @@ class VecCrew:
             for p in range(N_P):
                 card, htype, valid = s.comm[p]
                 comm_card[b, p] = card; comm_type[b, p] = htype; comm_valid[b, p] = bool(valid)
-                comm_used[b, p] = bool(s.comm_used[p])
+            comm_phase[b] = bool(s.comm_phase); comm_count[b] = s.comm_count
             led[b] = s.led_color; leader[b] = s.leader; turn[b] = s.turn
             tricks[b] = s.tricks_played
             done[b] = s.done; success[b] = s.success; failed[b] = s.failed
@@ -85,7 +85,7 @@ class VecCrew:
         self.owner = t(owner); self.assigned = t(assigned); self.order_pos = t(order_pos)
         self.done_tasks = t(done_tasks); self.captured_by = t(captured); self.table = t(table)
         self.comm_card = t(comm_card); self.comm_type = t(comm_type); self.comm_valid = t(comm_valid)
-        self.comm_used = t(comm_used)
+        self.comm_phase = t(comm_phase); self.comm_count = t(comm_count)
         self.led = t(led); self.leader = t(leader); self.turn = t(turn)
         self.plays = t(plays); self.tricks = t(tricks)
         self.done = t(done); self.success = t(success); self.failed = t(failed)
@@ -122,8 +122,6 @@ class VecCrew:
             islow = in_col & (cnt >= 2) & (ranks[None, :] == minr)
             comm_legal[:, lo:hi] = only | ishigh | islow
             comm_type[:, lo:hi] = ishigh.long() + 2 * islow.long()   # only -> 0
-        used = self.comm_used[self.arangeB, self.turn]             # [B] bool
-        comm_legal = comm_legal & (~used[:, None])
         self._ctype_cache = comm_type   # reused by step() within the same ply
         return comm_legal, comm_type
 
@@ -136,9 +134,11 @@ class VecCrew:
         use_follow = (~leading) & has_follow
         play = torch.where(use_follow[:, None], follow, hand)      # [B,N_C]
         comm_legal, _ = self._comm_table()
-        full = torch.zeros((self.B, 2 * N_C), dtype=torch.bool, device=self.device)
-        full[:, :N_C] = play
-        full[:, N_C:] = comm_legal
+        in_comm = self.comm_phase[:, None]                         # [B,1]
+        full = torch.zeros((self.B, E.ACT_DIM), dtype=torch.bool, device=self.device)
+        full[:, :N_C] = play & (~in_comm)                          # plays only in play phase
+        full[:, N_C:2 * N_C] = comm_legal & in_comm                # comm only in comm phase
+        full[:, E.PASS_ACTION] = self.comm_phase                   # pass legal in comm phase
         # safety for finished games whose current player may be empty-handed
         empty = ~full.any(dim=1)
         if empty.any():
@@ -217,57 +217,70 @@ class VecCrew:
             type_oh[self.arangeB[mt], htype[mt]] = 1.0
             valid = self.comm_valid[self.arangeB, q].float()[:, None]
             blocks.append(card_oh); blocks.append(type_oh); blocks.append(valid)
-        # 11b communication token available, relative seating
-        avail = (~self.comm_used).float()
-        blocks.append(torch.stack([avail[self.arangeB, (turn + off) % N_P]
-                                   for off in range(N_P)], dim=1))
         # 12 relative hand sizes
         counts = torch.stack([(self.owner == p).sum(dim=1) for p in range(N_P)], dim=1).float()
         rel = torch.stack([counts[self.arangeB, (turn + off) % N_P] for off in range(N_P)], dim=1)
         blocks.append(rel / E.CARDS_PER_PLAYER_MAX)
-        # 13 scalars
+        # 13 scalars (incl. communication-phase flag)
         sc = torch.stack([
             self.tricks.float() / TOTAL_TRICKS,
             (turn == self.leader).float(),
             self.plays.float() / N_P,
+            self.comm_phase.float(),
         ], dim=1)
         blocks.append(sc)
         return torch.cat(blocks, dim=1)
 
     # ------------------------------------------------------------------- step
     def step(self, actions):
-        """Apply actions [B] (play 0..N_C-1 or communicate N_C..2N_C-1) for all
-        active games; communications don't advance the turn, plays do."""
+        """Apply actions [B]. During the comm phase: pass (PASS_ACTION) or
+        communicate (N_C..2N_C-1); otherwise play (0..N_C-1)."""
         active = ~self.done
-        is_comm = active & (actions >= N_C)
-        is_play = active & (actions < N_C)
+        in_comm = active & self.comm_phase
+        in_play = active & (~self.comm_phase)
 
-        # --- communication: reveal card, spend token, no turn/trick change ---
-        if bool(is_comm.any()):
-            # reuse comm_type from the legal_mask() call earlier this ply if the
-            # state is unchanged; otherwise recompute.
+        # --- communication round: record signal (if not a pass), then advance
+        #     the per-game decision pointer; exit to play after N_P decisions ---
+        if bool(in_comm.any()):
             ctype = getattr(self, "_ctype_cache", None)
             if ctype is None:
                 _, ctype = self._comm_table()
-            ci = is_comm.nonzero(as_tuple=True)[0]
-            tp = self.turn[ci]
-            c = actions[ci] - N_C
-            self.comm_card[ci, tp] = c
-            self.comm_type[ci, tp] = ctype[ci, c]
-            self.comm_valid[ci, tp] = True
-            self.comm_used[ci, tp] = True
+            ci = in_comm.nonzero(as_tuple=True)[0]
+            real = actions[ci] < E.PASS_ACTION          # comm action (not a pass)
+            rci = ci[real]
+            if rci.numel() > 0:
+                rtp = self.turn[rci]
+                rc = actions[rci] - N_C
+                self.comm_card[rci, rtp] = rc
+                self.comm_type[rci, rtp] = ctype[rci, rc]
+                self.comm_valid[rci, rtp] = True
+            self.comm_count[ci] += 1
+            done_comm = self.comm_count[ci] >= N_P
+            self.comm_phase[ci] = ~done_comm
+            self.turn[ci] = torch.where(done_comm, self.leader[ci],
+                                        (self.leader[ci] + self.comm_count[ci]) % N_P)
 
-        # --- play: place card, advance turn, maybe resolve the trick ---
+        # --- play: clear a consumed signal, place card, advance, maybe resolve ---
+        pidx = in_play.nonzero(as_tuple=True)[0]
+        if pidx.numel() > 0:
+            pturn = self.turn[pidx]
+            pa = actions[pidx]
+            clr = self.comm_card[pidx, pturn] == pa     # played the communicated card
+            cci = pidx[clr]
+            if cci.numel() > 0:
+                ct = self.turn[cci]
+                self.comm_card[cci, ct] = -1
+                self.comm_type[cci, ct] = -1
+                self.comm_valid[cci, ct] = False
         safe_a = torch.where(actions < N_C, actions, torch.zeros_like(actions))
-        first = is_play & (self.plays == 0)
+        first = in_play & (self.plays == 0)
         self.led = torch.where(first, self.COLOR[safe_a], self.led)
-        pidx = is_play.nonzero(as_tuple=True)[0]
         self.table[pidx, self.plays[pidx]] = actions[pidx]
         self.owner[pidx, actions[pidx]] = -1
-        self.plays = torch.where(is_play, self.plays + 1, self.plays)
-        self.turn = torch.where(is_play, (self.turn + 1) % N_P, self.turn)
+        self.plays = torch.where(in_play, self.plays + 1, self.plays)
+        self.turn = torch.where(in_play, (self.turn + 1) % N_P, self.turn)
 
-        resolve = is_play & (self.plays == N_P)
+        resolve = in_play & (self.plays == N_P)
         if bool(resolve.any()):
             self._resolve(resolve)
         self._ctype_cache = None   # state changed: invalidate comm_type cache
