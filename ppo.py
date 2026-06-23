@@ -66,8 +66,13 @@ MAX_PLIES = E.MAX_PLIES   # plays + communications (comm actions don't advance t
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_ppo_model():
-    return PolicyValueNet(bounded_value=False)
+def build_ppo_model(hidden=None, n_blocks=None):
+    kw = {}
+    if hidden is not None:
+        kw["hidden"] = hidden
+    if n_blocks is not None:
+        kw["n_blocks"] = n_blocks
+    return PolicyValueNet(bounded_value=False, **kw)
 
 
 @torch.no_grad()
@@ -208,6 +213,8 @@ def main():
     ap.add_argument("--state", type=str, default=os.path.join(E.CACHE_DIR, "ppo_state.pt"))
     ap.add_argument("--solvable", action="store_true",
                     help="train+eval on constructed solvable missions only")
+    ap.add_argument("--hidden", type=int, default=None, help="override model width")
+    ap.add_argument("--n-blocks", type=int, default=None, help="override #residual blocks")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -215,10 +222,10 @@ def main():
     rng = np.random.default_rng(args.seed)
     print(f"Device: {DEVICE}  |  PPO on-policy self-play")
 
-    model = build_ppo_model().to(DEVICE)
+    model = build_ppo_model(args.hidden, args.n_blocks).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {n_params:,}")
+    print(f"Model params: {n_params:,}  (hidden={args.hidden or HIDDEN}, blocks={args.n_blocks or N_BLOCKS})")
 
     level, roll_wr, best_eval, it = START_LEVEL, 0.0, -1.0, 0
 
