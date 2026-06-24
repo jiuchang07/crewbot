@@ -43,14 +43,19 @@ CARDS_PER_PLAYER_MAX = (N_CARDS + N_PLAYERS - 1) // N_PLAYERS  # 14
 # captured -> that mission fails, which is correct game behavior.
 TOTAL_TRICKS = N_CARDS // N_PLAYERS               # 13
 
-# Action space: 0..39 play card c; 40..79 communicate card c; 80 = pass.
-# Communication happens only in a one-round setup phase at the start of the
-# game (before any trick): each player, in turn order from the leader, either
-# communicates one eligible card or passes. No mid-trick / per-trick comm.
-COMM_OFFSET = N_CARDS                              # comm action id = COMM_OFFSET + card
-PASS_ACTION = 2 * N_CARDS                          # decline to communicate (80)
-# A game = N_PLAYERS comm-phase decisions + TOTAL_TRICKS*N_PLAYERS plays. +1 cushion.
-MAX_PLIES = N_PLAYERS + TOTAL_TRICKS * N_PLAYERS + 1
+# Action space:
+#   0..39    play card c
+#   40..79   communicate card c
+#   80       pass (decline to communicate)
+#   81..116  claim task card c (c in 0..35, non-trump) during distribution
+# Phase order each game: distribute tasks -> communicate -> play tricks.
+COMM_OFFSET = N_CARDS                              # 40
+PASS_ACTION = 2 * N_CARDS                          # 80
+CLAIM_OFFSET = 2 * N_CARDS + 1                     # 81; claim id = CLAIM_OFFSET + card
+N_TASK_CARDS = N_COLORS * RANKS_PER_COLOR          # 36 possible task cards (non-trump)
+MAX_TASKS = 10                                     # most tasks any mission has
+# A game = up to MAX_TASKS claims + N_PLAYERS comm decisions + plays. +1 cushion.
+MAX_PLIES = MAX_TASKS + N_PLAYERS + TOTAL_TRICKS * N_PLAYERS + 1
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "crewbot")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
@@ -177,13 +182,14 @@ NON_TRUMP_CARDS = [c for c in range(N_CARDS) if not is_trump(c)]
 @dataclass
 class Mission:
     mission_id: int                 # 1..50
-    assign: dict                    # card_index -> player who must capture it
+    task_cards: list                # the revealed task pool, in reveal order
     card_preds: dict = field(default_factory=dict)  # card -> set of cards that must precede it
     tiles: dict = field(default_factory=dict)        # card -> tile label (display/info)
+    witness_assign: dict = field(default_factory=dict)  # winnable card->player (proof; not shown)
 
     @property
     def tasks(self):
-        return list(self.assign.keys())
+        return list(self.task_cards)
 
 def _slot_to_card_constraints(task_cards, tiles_spec):
     """Map slot-level tiles to per-card predecessors + tile labels. task_cards are
@@ -196,13 +202,12 @@ def _slot_to_card_constraints(task_cards, tiles_spec):
     return card_preds, tiles
 
 def sample_mission(rng, mission_id):
-    """Draw a concrete mission instance (random task cards + assignment)."""
+    """Random task pool (no assignment — players claim during distribution)."""
     spec = MISSIONS[mission_id]
     num_tasks = min(spec['tasks'], len(NON_TRUMP_CARDS))
     task_cards = [int(c) for c in rng.choice(NON_TRUMP_CARDS, size=num_tasks, replace=False)]
-    assign = {c: int(rng.integers(N_PLAYERS)) for c in task_cards}
     card_preds, tiles = _slot_to_card_constraints(task_cards, spec['tiles'])
-    return Mission(mission_id=mission_id, assign=assign, card_preds=card_preds, tiles=tiles)
+    return Mission(mission_id=mission_id, task_cards=task_cards, card_preds=card_preds, tiles=tiles)
 
 # ---------------------------------------------------------------------------
 # Trick resolution
@@ -301,8 +306,9 @@ def is_solvable(hands, assigned, card_preds, node_cap=4000):
 class GameState:
     hands: list                     # list[set[int]] per player
     mission: Mission
-    assigned: np.ndarray            # [40] player assigned, or -1
-    card_preds: dict                # card -> set of task cards that must precede it
+    assigned: np.ndarray            # [40] player who claimed each task card, or -1
+    card_preds: dict                # task card -> set of task cards that must precede it
+    task_cards: frozenset           # the revealed task pool (all task cards this mission)
     done_tasks: set                 # completed task cards
     captured_by: np.ndarray         # [40] player who captured card, or -1
     on_table: list                  # list[(player, card)] current trick
@@ -310,7 +316,10 @@ class GameState:
     leader: int                     # player who leads current trick
     turn: int                       # current player to act
     comm: list                      # per player: (card, type, valid); type 0=only,1=high,2=low
-    comm_phase: bool                # True during the start-of-game communication round
+    allow_comm: bool                # whether a communication round happens after distribution
+    dist_phase: bool                # True during the task-distribution round
+    dist_count: int                 # number of tasks claimed so far
+    comm_phase: bool                # True during the communication round
     comm_count: int                 # players who have made their comm-phase decision
     tricks_played: int
     done: bool = False
@@ -354,9 +363,8 @@ def _deal(rng):
     return hands
 
 def _mission_arrays(mission):
+    # assigned starts empty (-1): players claim tasks during the distribution phase
     assigned = np.full(N_CARDS, -1, dtype=np.int64)
-    for c, p in mission.assign.items():
-        assigned[c] = p
     card_preds = {int(c): set(int(d) for d in preds)
                   for c, preds in mission.card_preds.items()}
     return assigned, card_preds
@@ -395,15 +403,34 @@ def construct_solvable_mission(rng, hands, mission_id):
     constraint -> the mission is solvable by construction."""
     spec = MISSIONS[mission_id]
     caps = _playout_captures(rng, hands)
-    cand = [(ti, w, c) for (ti, w, c) in caps if not is_trump(c)]
-    num_tasks = min(spec['tasks'], len(cand))
-    chosen = sorted(rng.choice(len(cand), size=num_tasks, replace=False))
-    sel = [cand[i] for i in chosen]                 # preserves (trick, play-order)
-    # reveal order = completion order, so tile[i] lands on the i-th-completed task
-    task_cards = [int(c) for (ti, w, c) in sel]
-    assign = {int(c): int(w) for (ti, w, c) in sel}
+    # Each player's own non-trump captures, in completion order.
+    by_player = {p: [] for p in range(N_PLAYERS)}
+    for (ti, w, c) in caps:
+        if not is_trump(c):
+            by_player[w].append((ti, c))
+    leader = next(p for p in range(N_PLAYERS) if 39 in hands[p])
+    target = min(spec['tasks'], len(NON_TRUMP_CARDS))
+
+    # Round-robin claim from the commander, each player contributing their OWN
+    # captures. This yields a near-even distribution (claim-order reachable) that
+    # the play-out line itself wins -> solvable under Standard distribution.
+    picked, ptr, i = [], {p: 0 for p in range(N_PLAYERS)}, 0
+    while len(picked) < target:
+        pl = (leader + i) % N_PLAYERS
+        i += 1
+        if ptr[pl] < len(by_player[pl]):
+            ti, c = by_player[pl][ptr[pl]]
+            ptr[pl] += 1
+            picked.append((ti, pl, c))
+        if all(ptr[q] >= len(by_player[q]) for q in range(N_PLAYERS)):
+            break
+
+    picked.sort(key=lambda x: x[0])                  # completion order -> tile order
+    task_cards = [int(c) for (ti, pl, c) in picked]
+    witness = {int(c): int(pl) for (ti, pl, c) in picked}
     card_preds, tiles = _slot_to_card_constraints(task_cards, spec['tiles'])
-    return Mission(mission_id=mission_id, assign=assign, card_preds=card_preds, tiles=tiles)
+    return Mission(mission_id=mission_id, task_cards=task_cards, card_preds=card_preds,
+                   tiles=tiles, witness_assign=witness)
 
 def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40):
     hands = _deal(rng)
@@ -415,23 +442,32 @@ def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40)
     else:
         mission = sample_mission(rng, mission_id)
     assigned, card_preds = _mission_arrays(mission)
+    task_cards = frozenset(int(c) for c in mission.task_cards)
 
-    # Communication starts empty; filled during the setup round (if enabled).
+    # Communication starts empty; filled during the comm round (after distribution).
     comm = [(-1, -1, 0) for _ in range(N_PLAYERS)]
 
-    # Commander = holder of the highest trump (rocket 4) leads the first trick
-    # and decides first in the communication round.
+    # Commander = holder of the highest trump (rocket 4); claims first, then leads.
     leader = next(p for p in range(N_PLAYERS) if 39 in hands[p])
+
+    # Phase order: distribute tasks (if any) -> communicate -> play.
+    dist_phase = len(task_cards) > 0
+    comm_phase = bool(use_comm) and not dist_phase   # comm waits until after dist
 
     return GameState(
         hands=hands, mission=mission, assigned=assigned, card_preds=card_preds,
-        done_tasks=set(), captured_by=np.full(N_CARDS, -1, dtype=np.int64),
+        task_cards=task_cards, done_tasks=set(),
+        captured_by=np.full(N_CARDS, -1, dtype=np.int64),
         on_table=[], led_color=-1, leader=leader, turn=leader, comm=comm,
-        comm_phase=bool(use_comm), comm_count=0, tricks_played=0,
+        allow_comm=bool(use_comm), dist_phase=dist_phase, dist_count=0,
+        comm_phase=comm_phase, comm_count=0, tricks_played=0,
     )
 
 def legal_actions(s):
-    # Setup communication round: pass, or reveal one eligible card.
+    # Distribution round: claim one unclaimed task from the revealed pool.
+    if s.dist_phase:
+        return [CLAIM_OFFSET + c for c in sorted(s.task_cards) if s.assigned[c] == -1]
+    # Communication round: pass, or reveal one eligible card.
     if s.comm_phase:
         return [PASS_ACTION] + [COMM_OFFSET + c for c in sorted(communicable(s.hands[s.turn]))]
     # Trick play.
@@ -442,10 +478,25 @@ def legal_actions(s):
     return sorted(follow) if follow else sorted(hand)
 
 def step(s, action):
-    """Apply `action`: during the comm phase a pass (80) or communicate (40..79);
-    otherwise a play (0..39)."""
+    """Apply `action`: claim (81..116) during distribution; pass/communicate
+    (80 / 40..79) during the comm round; otherwise play (0..39)."""
     assert not s.done
     p = s.turn
+
+    # --- Distribution round: claim a task; clockwise from commander until pool empty.
+    if s.dist_phase:
+        c = action - CLAIM_OFFSET
+        assert c in s.task_cards and s.assigned[c] == -1, f"illegal claim {card_name(c)}"
+        s.assigned[c] = p
+        s.dist_count += 1
+        if all(s.assigned[t] != -1 for t in s.task_cards):   # pool exhausted
+            s.dist_phase = False
+            s.comm_phase = s.allow_comm
+            s.comm_count = 0
+            s.turn = s.leader
+        else:
+            s.turn = (s.leader + s.dist_count) % N_PLAYERS
+        return s
 
     # --- Communication round: each player decides once, in order from leader.
     if s.comm_phase:
@@ -497,7 +548,7 @@ def step(s, action):
     s.turn = winner
     s.tricks_played += 1
 
-    n_tasks = len(s.mission.assign)
+    n_tasks = len(s.task_cards)
     if s.failed:
         s.done, s.success = True, False
     elif len(s.done_tasks) == n_tasks:
@@ -549,7 +600,7 @@ def observe(s, player=None):
     blocks.append(_onehot(s.led_color if s.led_color != -1 else N_COLORS + 1, N_COLORS + 1)
                   if s.led_color != -1 else np.zeros(N_COLORS + 1, dtype=np.float32))
 
-    # 6-8. tasks relative to me / others / done
+    # 6-8. tasks relative to me / others / done (by who claimed them)
     mine = np.zeros(N_CARDS, dtype=np.float32)
     other = np.zeros(N_CARDS, dtype=np.float32)
     done = np.zeros(N_CARDS, dtype=np.float32)
@@ -565,12 +616,21 @@ def observe(s, player=None):
             other[c] = 1.0
     blocks.extend([mine, other, done])
 
+    # 8b. distribution pool: revealed task cards, and which are still unclaimed
+    pool = np.zeros(N_CARDS, dtype=np.float32)
+    unclaimed = np.zeros(N_CARDS, dtype=np.float32)
+    for c in s.task_cards:
+        pool[c] = 1.0
+        if s.assigned[c] == -1:
+            unclaimed[c] = 1.0
+    blocks.extend([pool, unclaimed])
+
     # 9. blocked-ness (fraction of a task's predecessors not yet done) and
-    # 10. "ready" (open task with all predecessors complete).
+    # 10. "ready" (open task with all predecessors complete) — for all revealed tasks.
     blocked = np.zeros(N_CARDS, dtype=np.float32)
     ready = np.zeros(N_CARDS, dtype=np.float32)
     for c in range(N_CARDS):
-        if s.assigned[c] == -1 or c in s.done_tasks:
+        if c not in s.task_cards or c in s.done_tasks:
             continue
         preds = s.card_preds.get(c, ())
         unmet = [d for d in preds if d not in s.done_tasks]
@@ -598,6 +658,7 @@ def observe(s, player=None):
         1.0 if s.turn == s.leader else 0.0,
         len(s.on_table) / N_PLAYERS,
         1.0 if s.comm_phase else 0.0,
+        1.0 if s.dist_phase else 0.0,
     ], dtype=np.float32))
 
     return np.concatenate(blocks)
@@ -608,8 +669,8 @@ def legal_mask(s):
         m[a] = 1.0
     return m
 
-# Action space: 40 play + 40 communicate + 1 pass.
-ACT_DIM = 2 * N_CARDS + 1
+# Action space: 40 play + 40 communicate + 1 pass + 36 claim-task.
+ACT_DIM = CLAIM_OFFSET + N_TASK_CARDS
 
 # Compute OBS_DIM once from a sample game.
 OBS_DIM = observe(new_game(np.random.default_rng(0), 1)).shape[0]
@@ -623,8 +684,15 @@ def _open_task(s, c):
 
 def heuristic_action(s, rng, epsilon=0.1):
     """Cooperative heuristic: deliver task cards to their assignee, otherwise
-    duck. Far from optimal, but gives self-play data real signal. Never
-    communicates: passes in the comm phase and plays cards otherwise."""
+    duck. Far from optimal, but gives self-play data real signal. In the
+    distribution round it claims a task it holds (else a random one); in the
+    comm round it passes; otherwise it plays cards."""
+    if s.dist_phase:
+        unclaimed = [c for c in sorted(s.task_cards) if s.assigned[c] == -1]
+        mine = [c for c in unclaimed if c in s.hands[s.turn]]   # prefer tasks I hold
+        pick = (mine or unclaimed)[0] if (mine or rng.random() > epsilon) \
+            else unclaimed[rng.integers(len(unclaimed))]
+        return CLAIM_OFFSET + int(pick)
     if s.comm_phase:
         return PASS_ACTION
     legal = [a for a in legal_actions(s) if a < COMM_OFFSET]
