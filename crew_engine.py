@@ -55,24 +55,100 @@ MAX_PLIES = N_PLAYERS + TOTAL_TRICKS * N_PLAYERS + 1
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "crewbot")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 
-# Difficulty ladder: the 50 campaign missions, approximated as an increasing
-# number of task cards plus (for harder missions) a required completion order.
-# Task cards themselves are drawn randomly each game, so this generalizes to
-# "any hand combination" automatically. (num_tasks, ordered)
-def _mission_table():
+# Real campaign missions (from The Crew mission log). Each entry:
+#   tasks  : number of task cards
+#   tiles  : priority-tile labels applied to the first len(tiles) revealed tasks,
+#            in reveal order. Numbered '1'..'5' (absolute position) and relative
+#            '>','>>','>>>','>>>>','W' (W = Omega, must be completed last).
+#   mode   : task distribution mode — 'standard' (pick from pool), 'group'
+#            (commander reveals one-by-one + yes/no + assign), 'solo' (one player
+#            does all). Build 1 trains all as 'standard'; mode kept for later.
+#   note   : deferred riders (comm variants / special objectives) not yet modeled.
+# Special-objective-only missions (no tasks) are out of scope for now: in_scope=False.
+_M = {
+    1:  dict(tasks=1,  tiles=[]),
+    2:  dict(tasks=2,  tiles=[]),
+    3:  dict(tasks=2,  tiles=['1', '2']),
+    4:  dict(tasks=3,  tiles=[]),
+    6:  dict(tasks=3,  tiles=['>', '>>'], note='comm interference'),
+    7:  dict(tasks=3,  tiles=['W']),
+    8:  dict(tasks=3,  tiles=['1', '2', '3']),
+    10: dict(tasks=4,  tiles=[]),
+    11: dict(tasks=4,  tiles=['1'], note='cmdr mutes a crew'),
+    12: dict(tasks=4,  tiles=['W'], note='post-trick1 random card pass'),
+    14: dict(tasks=4,  tiles=['>', '>>', '>>>'], note='comm interference'),
+    15: dict(tasks=4,  tiles=['1', '2', '3', '4']),
+    17: dict(tasks=2,  tiles=[], note='no 9 wins a trick'),
+    18: dict(tasks=5,  tiles=[], note='comm disrupted till trick 2'),
+    19: dict(tasks=5,  tiles=['1'], note='comm disrupted till trick 3'),
+    20: dict(tasks=2,  tiles=[], mode='solo'),
+    21: dict(tasks=5,  tiles=['1', '2'], note='comm interference'),
+    22: dict(tasks=5,  tiles=['>', '>>', '>>>', '>>>>']),
+    23: dict(tasks=5,  tiles=['1', '2', '3', '4', '5'], note='pre-pick tile swap'),
+    24: dict(tasks=6,  tiles=[], mode='group'),
+    25: dict(tasks=6,  tiles=['>', '>>'], note='comm interference'),
+    28: dict(tasks=6,  tiles=['1', 'W'], note='comm disrupted till trick 3'),
+    30: dict(tasks=6,  tiles=['>', '>>', '>>>'], note='comm disrupted till trick 2'),
+    31: dict(tasks=6,  tiles=['1', '2', '3']),
+    32: dict(tasks=7,  tiles=[], mode='group'),
+    35: dict(tasks=7,  tiles=['>', '>>', '>>>']),
+    36: dict(tasks=7,  tiles=['1', '2'], mode='group'),
+    37: dict(tasks=4,  tiles=[], mode='solo'),
+    38: dict(tasks=8,  tiles=[], note='comm disrupted till trick 3'),
+    39: dict(tasks=8,  tiles=['>', '>>', '>>>'], note='comm interference'),
+    40: dict(tasks=8,  tiles=['1', '2', '3'], note='pre-pick tile move'),
+    42: dict(tasks=9,  tiles=[]),
+    43: dict(tasks=9,  tiles=[], mode='group'),
+    45: dict(tasks=9,  tiles=['>', '>>', '>>>']),
+    47: dict(tasks=10, tiles=[]),
+    48: dict(tasks=3,  tiles=['W'], note='Omega on final trick'),
+    49: dict(tasks=10, tiles=['>', '>>', '>>>']),
+}
+# Special-objective-only missions (deferred): 5,9,13,16,26,29,33,34,41,44,46,50
+SPECIAL_ONLY = [5, 9, 13, 16, 26, 29, 33, 34, 41, 44, 46, 50]
+
+def _build_missions():
     table = {}
     for m in range(1, 51):
-        # tasks grow ~linearly with mission number, capped at 10
-        num_tasks = min(1 + (m - 1) // 5, 10)
-        if num_tasks < 1:
-            num_tasks = 1
-        # the back half of the campaign adds ordered-completion constraints
-        ordered = m >= 26
-        table[m] = (num_tasks, ordered)
+        spec = _M.get(m)
+        if spec is None:
+            table[m] = dict(tasks=0, tiles=[], mode='standard', in_scope=False, note='special')
+        else:
+            table[m] = dict(tasks=spec['tasks'], tiles=spec.get('tiles', []),
+                            mode=spec.get('mode', 'standard'), in_scope=True,
+                            note=spec.get('note', ''))
     return table
 
-MISSIONS = _mission_table()
+MISSIONS = _build_missions()
 ALL_MISSIONS = list(range(1, 51))
+TASK_MISSIONS = [m for m in ALL_MISSIONS if MISSIONS[m]['in_scope']]  # trainable set
+
+_REL_RANK = {'>': 1, '>>': 2, '>>>': 3, '>>>>': 4}
+
+def tiles_to_predecessors(tiles, num_tasks):
+    """Given tile labels on the first len(tiles) task slots (reveal order), return
+    preds[slot] = set of slots that must be completed before it. Encodes the real
+    rules: numbered tiles are absolute positions (and untiled tasks come after all
+    numbered); relative tiles form a chain; Omega ('W') must be completed last."""
+    labels = list(tiles) + [None] * (num_tasks - len(tiles))
+    numbered = {i: int(l) for i, l in enumerate(labels) if l and l.isdigit()}
+    relative = {i: _REL_RANK[l] for i, l in enumerate(labels) if l in _REL_RANK}
+    omega = [i for i, l in enumerate(labels) if l == 'W']
+    has_numbered = len(numbered) > 0
+    preds = [set() for _ in range(num_tasks)]
+    for i in range(num_tasks):
+        if i in numbered:
+            preds[i] = {j for j, n in numbered.items() if n < numbered[i]}
+        elif i in relative:
+            preds[i] = {j for j, r in relative.items() if r < relative[i]}
+        elif i in omega:
+            pass                                   # filled below
+        elif has_numbered:                          # untiled, numbered mission
+            preds[i] = set(numbered.keys())         # after all numbered tasks
+        # else untiled in a relative/plain mission: no predecessors (anytime)
+    for i in omega:                                 # Omega: after every other task
+        preds[i] = set(range(num_tasks)) - {i}
+    return preds
 
 # ---------------------------------------------------------------------------
 # Card helpers
@@ -102,24 +178,31 @@ NON_TRUMP_CARDS = [c for c in range(N_CARDS) if not is_trump(c)]
 class Mission:
     mission_id: int                 # 1..50
     assign: dict                    # card_index -> player who must capture it
-    order: list = field(default_factory=list)  # cards in required completion order ([] = unordered)
+    card_preds: dict = field(default_factory=dict)  # card -> set of cards that must precede it
+    tiles: dict = field(default_factory=dict)        # card -> tile label (display/info)
 
     @property
     def tasks(self):
         return list(self.assign.keys())
 
+def _slot_to_card_constraints(task_cards, tiles_spec):
+    """Map slot-level tiles to per-card predecessors + tile labels. task_cards are
+    in reveal order; tiles_spec applies to the first len(tiles_spec) of them."""
+    n = len(task_cards)
+    slot_preds = tiles_to_predecessors(tiles_spec, n)
+    card_preds = {int(task_cards[i]): {int(task_cards[j]) for j in slot_preds[i]}
+                  for i in range(n)}
+    tiles = {int(task_cards[i]): tiles_spec[i] for i in range(min(len(tiles_spec), n))}
+    return card_preds, tiles
+
 def sample_mission(rng, mission_id):
     """Draw a concrete mission instance (random task cards + assignment)."""
-    num_tasks, ordered = MISSIONS[mission_id]
-    num_tasks = min(num_tasks, len(NON_TRUMP_CARDS))
-    task_cards = list(rng.choice(NON_TRUMP_CARDS, size=num_tasks, replace=False))
-    assign = {int(c): int(rng.integers(N_PLAYERS)) for c in task_cards}
-    order = []
-    if ordered and num_tasks >= 2:
-        order = list(task_cards)
-        rng.shuffle(order)
-        order = [int(c) for c in order]
-    return Mission(mission_id=mission_id, assign=assign, order=order)
+    spec = MISSIONS[mission_id]
+    num_tasks = min(spec['tasks'], len(NON_TRUMP_CARDS))
+    task_cards = [int(c) for c in rng.choice(NON_TRUMP_CARDS, size=num_tasks, replace=False)]
+    assign = {c: int(rng.integers(N_PLAYERS)) for c in task_cards}
+    card_preds, tiles = _slot_to_card_constraints(task_cards, spec['tiles'])
+    return Mission(mission_id=mission_id, assign=assign, card_preds=card_preds, tiles=tiles)
 
 # ---------------------------------------------------------------------------
 # Trick resolution
@@ -160,7 +243,7 @@ def trick_winner(trick, led_color):
 # as unsolvable, which conservatively biases toward clearly-winnable missions).
 # ---------------------------------------------------------------------------
 
-def is_solvable(hands, assigned, order_pos, node_cap=4000):
+def is_solvable(hands, assigned, card_preds, node_cap=4000):
     tasks = [c for c in range(N_CARDS) if assigned[c] != -1]
     n_tasks = len(tasks)
     if n_tasks == 0:
@@ -169,7 +252,6 @@ def is_solvable(hands, assigned, order_pos, node_cap=4000):
     leader0 = next(p for p in range(N_PLAYERS) if 39 in hands[p])
     done = set()
     nodes = [0]
-    order_cards = [c for c in range(N_CARDS) if order_pos[c] > 0]
 
     def rec(on_table, led, turn, tricks_played):
         if len(done) == n_tasks:
@@ -199,8 +281,7 @@ def is_solvable(hands, assigned, order_pos, node_cap=4000):
                     if assigned[c] != -1:
                         if winner != assigned[c]:
                             ok = False; break
-                        op = order_pos[c]
-                        if op > 0 and not all(d in done for d in order_cards if 0 < order_pos[d] < op):
+                        if not all(d in done for d in card_preds.get(c, ())):
                             ok = False; break
                         done.add(c); added.append(c)
                 if ok and rec([], -1, winner, tricks_played + 1):
@@ -221,7 +302,7 @@ class GameState:
     hands: list                     # list[set[int]] per player
     mission: Mission
     assigned: np.ndarray            # [40] player assigned, or -1
-    order_pos: np.ndarray           # [40] 1-based order position, or 0 if unordered/not-task
+    card_preds: dict                # card -> set of task cards that must precede it
     done_tasks: set                 # completed task cards
     captured_by: np.ndarray         # [40] player who captured card, or -1
     on_table: list                  # list[(player, card)] current trick
@@ -276,10 +357,9 @@ def _mission_arrays(mission):
     assigned = np.full(N_CARDS, -1, dtype=np.int64)
     for c, p in mission.assign.items():
         assigned[c] = p
-    order_pos = np.zeros(N_CARDS, dtype=np.int64)
-    for i, c in enumerate(mission.order):
-        order_pos[c] = i + 1
-    return assigned, order_pos
+    card_preds = {int(c): set(int(d) for d in preds)
+                  for c, preds in mission.card_preds.items()}
+    return assigned, card_preds
 
 def _playout_captures(rng, hands):
     """Random-legal cooperative play-out. Returns captures as (trick_idx, winner,
@@ -310,17 +390,20 @@ def _playout_captures(rng, hands):
 
 def construct_solvable_mission(rng, hands, mission_id):
     """Build a guaranteed-winnable mission: play a cooperative line, then assign
-    chosen captured (non-trump) cards to whoever captured them, in completion
-    order. The recorded line is itself a solution, so the mission is solvable."""
-    num_tasks, ordered = MISSIONS[mission_id]
+    chosen captured (non-trump) cards to whoever captured them. Tiles are applied
+    in the line's completion order, so the recorded line satisfies every ordering
+    constraint -> the mission is solvable by construction."""
+    spec = MISSIONS[mission_id]
     caps = _playout_captures(rng, hands)
     cand = [(ti, w, c) for (ti, w, c) in caps if not is_trump(c)]
-    num_tasks = min(num_tasks, len(cand))
+    num_tasks = min(spec['tasks'], len(cand))
     chosen = sorted(rng.choice(len(cand), size=num_tasks, replace=False))
     sel = [cand[i] for i in chosen]                 # preserves (trick, play-order)
+    # reveal order = completion order, so tile[i] lands on the i-th-completed task
+    task_cards = [int(c) for (ti, w, c) in sel]
     assign = {int(c): int(w) for (ti, w, c) in sel}
-    order = [int(c) for (ti, w, c) in sel] if (ordered and num_tasks >= 2) else []
-    return Mission(mission_id=mission_id, assign=assign, order=order)
+    card_preds, tiles = _slot_to_card_constraints(task_cards, spec['tiles'])
+    return Mission(mission_id=mission_id, assign=assign, card_preds=card_preds, tiles=tiles)
 
 def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40):
     hands = _deal(rng)
@@ -331,7 +414,7 @@ def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40)
         mission = construct_solvable_mission(rng, hands, mission_id)
     else:
         mission = sample_mission(rng, mission_id)
-    assigned, order_pos = _mission_arrays(mission)
+    assigned, card_preds = _mission_arrays(mission)
 
     # Communication starts empty; filled during the setup round (if enabled).
     comm = [(-1, -1, 0) for _ in range(N_PLAYERS)]
@@ -341,7 +424,7 @@ def new_game(rng, mission_id, use_comm=True, solvable_only=False, max_redeal=40)
     leader = next(p for p in range(N_PLAYERS) if 39 in hands[p])
 
     return GameState(
-        hands=hands, mission=mission, assigned=assigned, order_pos=order_pos,
+        hands=hands, mission=mission, assigned=assigned, card_preds=card_preds,
         done_tasks=set(), captured_by=np.full(N_CARDS, -1, dtype=np.int64),
         on_table=[], led_color=-1, leader=leader, turn=leader, comm=comm,
         comm_phase=bool(use_comm), comm_count=0, tricks_played=0,
@@ -402,12 +485,9 @@ def step(s, action):
             if winner != s.assigned[c]:
                 s.failed = True
             else:
-                op = s.order_pos[c]
-                if op > 0:
-                    # all earlier-order tasks must already be completed
-                    earlier = [d for d in range(N_CARDS) if 0 < s.order_pos[d] < op]
-                    if not all(d in s.done_tasks for d in earlier):
-                        s.failed = True
+                # every predecessor task (priority tiles) must already be done
+                if not all(d in s.done_tasks for d in s.card_preds.get(c, ())):
+                    s.failed = True
                 if not s.failed:
                     s.done_tasks.add(int(c))
 
@@ -485,19 +565,20 @@ def observe(s, player=None):
             other[c] = 1.0
     blocks.extend([mine, other, done])
 
-    # 9. order position (normalized) and 10. "ready" (all predecessors done)
-    n_order = int(s.order_pos.max())
-    order_norm = np.where(s.order_pos > 0, s.order_pos / max(n_order, 1), 0.0).astype(np.float32)
+    # 9. blocked-ness (fraction of a task's predecessors not yet done) and
+    # 10. "ready" (open task with all predecessors complete).
+    blocked = np.zeros(N_CARDS, dtype=np.float32)
     ready = np.zeros(N_CARDS, dtype=np.float32)
     for c in range(N_CARDS):
-        op = s.order_pos[c]
-        if op > 0 and c not in s.done_tasks:
-            earlier = [d for d in range(N_CARDS) if 0 < s.order_pos[d] < op]
-            if all(d in s.done_tasks for d in earlier):
-                ready[c] = 1.0
-        elif s.assigned[c] != -1 and op == 0 and c not in s.done_tasks:
+        if s.assigned[c] == -1 or c in s.done_tasks:
+            continue
+        preds = s.card_preds.get(c, ())
+        unmet = [d for d in preds if d not in s.done_tasks]
+        if preds:
+            blocked[c] = len(unmet) / len(preds)
+        if not unmet:
             ready[c] = 1.0
-    blocks.extend([order_norm, ready])
+    blocks.extend([blocked, ready])
 
     # 11. communication hints, relative seating (offset 0 = self)
     for off in range(N_PLAYERS):
@@ -628,7 +709,7 @@ def evaluate_winrate(action_fn, missions=None, games_per_mission=200, seed=12345
 
     Returns (overall_win_rate, {mission_id: win_rate}).
     """
-    missions = missions if missions is not None else ALL_MISSIONS
+    missions = missions if missions is not None else TASK_MISSIONS
     rng = np.random.default_rng(seed)
     per = {}
     wins_total = games_total = 0
@@ -649,8 +730,12 @@ if __name__ == "__main__":
     print(f"OBS_DIM={OBS_DIM} ACT_DIM={ACT_DIM}")
     heur = lambda s: heuristic_action(s, rng, epsilon=0.0)
     rand = lambda s: int(legal_actions(s)[rng.integers(len(legal_actions(s)))])
+    print(f"task missions: {len(TASK_MISSIONS)}  (special-only deferred: {len(SPECIAL_ONLY)})")
+    sample = [1, 3, 7, 8, 15, 22, 31, 42, 49]   # spans plain/numbered/relative/Omega tiles
     for name, fn in [("random", rand), ("heuristic", heur)]:
-        wr, per = evaluate_winrate(fn, missions=[1, 5, 10, 20, 30, 40, 50],
-                                   games_per_mission=300)
-        print(f"{name:10s} overall={wr:.3f}  " +
-              "  ".join(f"m{m}={per[m]:.2f}" for m in sorted(per)))
+        for so in (False, True):
+            wr, per = evaluate_winrate(fn, missions=sample, games_per_mission=200,
+                                       solvable_only=so)
+            tag = "solvable" if so else "random  "
+            print(f"{name:10s} {tag} overall={wr:.3f}  " +
+                  "  ".join(f"m{m}={per[m]:.2f}" for m in sorted(per)))
