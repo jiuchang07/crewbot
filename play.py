@@ -294,6 +294,30 @@ def print_menu(s, ordered, best, dist, win):
     return idx_map
 
 
+def print_menu_blind(s):
+    """Blind-mode menu: show legal moves in natural order, no bot data.
+    Returns {menu_index: action} and the ordered list of actions."""
+    legal = E.legal_actions(s)
+    print(_c("\nYour move — choose without the bot's guidance:", "1;97"))
+    idx_map = {}
+    for i, a in enumerate(legal, 1):
+        idx_map[i] = a
+        print(f"   {i:>2}  {action_label(s, a)}")
+    return idx_map, legal
+
+
+def reveal_analysis(s, chosen, ordered, best, dist, win):
+    """After blind choice, print the full bot analysis table plus coaching feedback."""
+    print(_c("\n--- Bot analysis revealed ---", "1;97"))
+    print(f"   {'#':>2}  {'move':<34} {'bot instinct':>12} {'win %':>8}")
+    for i, a in enumerate(ordered, 1):
+        star = _c(" ★ recommended", "1;92") if a == best else ""
+        you  = _c(" ◄ your pick", "1;96") if a == chosen else ""
+        wtxt = f"{100*win[a]:6.0f}%" if a in win else "   —  "
+        print(f"   {i:>2}  {action_label(s, a):<34} {100*dist.get(a,0):10.0f}%  {wtxt}{star}{you}")
+    print(_c("----------------------------", "1;97"))
+
+
 def _step_and_log(s, a, human_seat):
     """Apply any action in-place; return human-readable log lines (incl. a
     resolved-trick note when the trick completes)."""
@@ -406,45 +430,60 @@ def explore(root, bot, human_seat, rollouts):
         print(_c("  ? unrecognized command.", "91"))
 
 
-def human_decision(s, bot, human_seat, rollouts, divergences):
-    ordered, best, dist, win = analyze(s, bot, rollouts)
-    idx_map = print_menu(s, ordered, best, dist, win)
-
-    # input loop
-    while True:
-        raw = input(_c("\n  Choose # (or 'h' hint, 'd' deep analysis, 'f' fork & explore, "
-                       "'q' quit): ", "96")).strip().lower()
-        if raw in ("q", "quit"):
-            print("Bye!")
-            sys.exit(0)
-        if raw in ("h", "hint", ""):
-            why = f"Bot recommends {action_label(s, best)}"
-            if best in win:
-                why += f" — best win chance ({100*win[best]:.0f}%)."
-            print(_c("  💡 " + why, "92"))
-            continue
-        if raw in ("f", "fork", "explore"):
-            committed = explore(s, bot, human_seat, rollouts)
-            if committed is not None:
-                chosen = committed
-                print(_c(f"  ↳ committing your explored move: {action_label(s, chosen)}", "95"))
+def human_decision(s, bot, human_seat, rollouts, divergences, blind=False):
+    if blind:
+        # --- blind mode: player picks first, analysis revealed after ---
+        idx_map, _ = print_menu_blind(s)
+        while True:
+            raw = input(_c("\n  Choose # ('q' quit): ", "96")).strip().lower()
+            if raw in ("q", "quit"):
+                print("Bye!")
+                sys.exit(0)
+            if raw.isdigit() and int(raw) in idx_map:
+                chosen = idx_map[int(raw)]
                 break
-            idx_map = print_menu(s, ordered, best, dist, win)   # redraw on return
-            continue
-        if raw in ("d", "deep"):
-            if bot.model is None:
-                print(_c("  (deeper analysis needs a trained checkpoint)", "90"))
+            print(_c("  ? enter one of the listed numbers.", "91"))
+        # now compute analysis and reveal
+        ordered, best, dist, win = analyze(s, bot, rollouts)
+        reveal_analysis(s, chosen, ordered, best, dist, win)
+    else:
+        # --- normal mode: analysis shown upfront ---
+        ordered, best, dist, win = analyze(s, bot, rollouts)
+        idx_map = print_menu(s, ordered, best, dist, win)
+        while True:
+            raw = input(_c("\n  Choose # (or 'h' hint, 'd' deep analysis, 'f' fork & explore, "
+                           "'q' quit): ", "96")).strip().lower()
+            if raw in ("q", "quit"):
+                print("Bye!")
+                sys.exit(0)
+            if raw in ("h", "hint", ""):
+                why = f"Bot recommends {action_label(s, best)}"
+                if best in win:
+                    why += f" — best win chance ({100*win[best]:.0f}%)."
+                print(_c("  💡 " + why, "92"))
                 continue
-            print(_c("  …deep rollout (200/move)", "90"))
-            ordered, best, dist, win = analyze(s, bot, 200, show_progress=False)
-            idx_map = print_menu(s, ordered, best, dist, win)
-            continue
-        if raw.isdigit() and int(raw) in idx_map:
-            chosen = idx_map[int(raw)]
-            break
-        print(_c("  ? enter one of the listed numbers.", "91"))
+            if raw in ("f", "fork", "explore"):
+                committed = explore(s, bot, human_seat, rollouts)
+                if committed is not None:
+                    chosen = committed
+                    print(_c(f"  ↳ committing your explored move: {action_label(s, chosen)}", "95"))
+                    break
+                idx_map = print_menu(s, ordered, best, dist, win)   # redraw on return
+                continue
+            if raw in ("d", "deep"):
+                if bot.model is None:
+                    print(_c("  (deeper analysis needs a trained checkpoint)", "90"))
+                    continue
+                print(_c("  …deep rollout (200/move)", "90"))
+                ordered, best, dist, win = analyze(s, bot, 200, show_progress=False)
+                idx_map = print_menu(s, ordered, best, dist, win)
+                continue
+            if raw.isdigit() and int(raw) in idx_map:
+                chosen = idx_map[int(raw)]
+                break
+            print(_c("  ? enter one of the listed numbers.", "91"))
 
-    # coaching feedback
+    # coaching feedback (shared for both modes)
     if chosen == best:
         print(_c(f"  ✓ Agrees with the bot: {action_label(s, chosen)}", "92"))
     else:
@@ -504,7 +543,7 @@ def print_reveal(start_hands, final_state, human_seat, play_log):
 # Game loop
 # ---------------------------------------------------------------------------
 
-def play_game(mission_id, human_seat, bot, rollouts, seed=None):
+def play_game(mission_id, human_seat, bot, rollouts, seed=None, blind=False):
     rng = np.random.default_rng(seed)
     s = E.new_game(rng, mission_id, use_comm=True)
     if human_seat is None:
@@ -526,7 +565,7 @@ def play_game(mission_id, human_seat, bot, rollouts, seed=None):
         actor, in_comm = s.turn, s.comm_phase
         if s.turn == human_seat:
             render_board(s, human_seat)
-            a = human_decision(s, bot, human_seat, rollouts, divergences)
+            a = human_decision(s, bot, human_seat, rollouts, divergences, blind=blind)
             E.step(s, a)
         else:
             a = bot.greedy_action(s)
@@ -591,6 +630,8 @@ def main():
     ap.add_argument("--ckpt", type=str, default=os.path.join(E.CACHE_DIR, "ppo_real_model.pt"))
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--blind", action="store_true",
+                    help="hide bot instinct/win%% until after you move; revealed as feedback")
     args = ap.parse_args()
     _USE_COLOR = not args.no_color
 
@@ -598,6 +639,8 @@ def main():
     bot = Bot(ckpt=args.ckpt, device=device)
 
     print(_c("\n  The Crew: The Quest for Planet Nine — play & learn with the bot", "1;96"))
+    if args.blind:
+        print(_c("  [BLIND MODE] Bot analysis is hidden — make your move, then it's revealed.", "1;95"))
     if bot.model is None:
         print(_c("  (No checkpoint — using the heuristic. Train one with `python ppo.py`.)", "93"))
 
@@ -607,7 +650,7 @@ def main():
         mission = int(raw) if raw.isdigit() and 1 <= int(raw) <= 50 else 1
 
     while True:
-        play_game(mission, args.seat, bot, args.rollouts, seed=args.seed)
+        play_game(mission, args.seat, bot, args.rollouts, seed=args.seed, blind=args.blind)
         again = input(_c("\n  Play again? same mission [Enter], new # 1-50, or 'q': ", "96")).strip().lower()
         if again in ("q", "quit", "n", "no"):
             break
