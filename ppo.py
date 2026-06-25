@@ -79,9 +79,10 @@ def build_ppo_model(hidden=None, n_blocks=None):
 def rollout(model, rng, level, device, batch, solvable_only=False):
     """Collect `batch` full self-play episodes under the current policy.
     Returns flat tensors over active decisions plus the rollout win rate."""
-    mids = rng.integers(1, level + 1, size=batch)
+    pool = [m for m in E.TASK_MISSIONS if m <= level] or [E.TASK_MISSIONS[0]]
+    mids = rng.choice(pool, size=batch)
     vec = VecCrew.new_games(batch, mids, rng, device=device, solvable_only=solvable_only)
-    n_tasks = (vec.assigned >= 0).sum(dim=1).clamp(min=1).float()
+    n_tasks = vec.is_task.sum(dim=1).clamp(min=1).float()   # fixed pool size per game
 
     O, A, LP, V, LE, R, AC, TM = [], [], [], [], [], [], [], []
     for _ in range(MAX_PLIES):
@@ -188,14 +189,14 @@ def vec_evaluate(model, games_per_mission, device, seed=12345, solvable_only=Fal
     Replaces the slow per-decision scalar eval — seconds instead of minutes."""
     model.eval()
     rng = np.random.default_rng(seed)
-    mids = np.repeat(np.arange(1, 51), games_per_mission)
+    mids = np.repeat(np.array(E.TASK_MISSIONS), games_per_mission)   # in-scope only
     vec = VecCrew.new_games(len(mids), mids, rng, device=device, solvable_only=solvable_only)
     for _ in range(MAX_PLIES):
         logits, _ = model(vec.observe())
         logits = logits.masked_fill(~vec.legal_mask(), float("-inf"))
         vec.step(logits.argmax(dim=-1))
     succ = vec.success.cpu().numpy()
-    per = {m: float(succ[mids == m].mean()) for m in E.ALL_MISSIONS}
+    per = {m: float(succ[mids == m].mean()) for m in E.TASK_MISSIONS}
     model.train()
     return float(succ.mean()), per
 
@@ -225,7 +226,8 @@ def main():
     model = build_ppo_model(args.hidden, args.n_blocks).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model params: {n_params:,}  (hidden={args.hidden or HIDDEN}, blocks={args.n_blocks or N_BLOCKS})")
+    import train as _t
+    print(f"Model params: {n_params:,}  (hidden={args.hidden or _t.HIDDEN}, blocks={args.n_blocks or _t.N_BLOCKS})")
 
     level, roll_wr, best_eval, it = START_LEVEL, 0.0, -1.0, 0
 
@@ -271,7 +273,7 @@ def main():
 
         if args.eval_every and it > 0 and it % args.eval_every == 0:
             overall, per = vec_evaluate(model, args.eval_games, DEVICE, solvable_only=args.solvable)
-            cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
+            cleared = [m for m in E.TASK_MISSIONS if per[m] >= 0.5]
             print(f"  [eval] win_rate {overall:.4f} | mission_level "
                   f"{max(cleared) if cleared else 0} | level {level}", flush=True)
             if overall > best_eval:
@@ -285,7 +287,7 @@ def main():
     save_state()
     # final eval (the reported metric)
     overall, per = vec_evaluate(model, args.eval_games, DEVICE, solvable_only=args.solvable)
-    cleared = [m for m in E.ALL_MISSIONS if per[m] >= 0.5]
+    cleared = [m for m in E.TASK_MISSIONS if per[m] >= 0.5]
     if overall > best_eval:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         torch.save(model.state_dict(), args.out)
@@ -299,7 +301,9 @@ def main():
     bands = {"m01-10": range(1, 11), "m11-20": range(11, 21), "m21-30": range(21, 31),
              "m31-40": range(31, 41), "m41-50": range(41, 51)}
     for name, r in bands.items():
-        print(f"  {name}: {np.mean([per[m] for m in r]):.3f}")
+        vals = [per[m] for m in r if m in per]      # in-scope task missions only
+        if vals:
+            print(f"  {name}: {np.mean(vals):.3f}")
 
 
 if __name__ == "__main__":
