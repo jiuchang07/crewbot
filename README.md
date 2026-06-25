@@ -71,6 +71,46 @@ python train.py --minutes 120 --eval-games 200     # train, then evaluate
 
 The trained model is saved to `~/.cache/crewbot/model.pt`.
 
+## Play with the bot and learn the optimal moves
+
+`play.py` is an interactive coach: **you** take one seat, the trained bot plays
+the other two, and on every one of your decisions it shows the bot's analysis so
+you can learn *why* a move is good — not just what to play.
+
+```bash
+python play.py                          # auto seat (commander), pick a mission
+python play.py --mission 12 --seat 0    # specific mission / seat
+python play.py --rollouts 0             # instant play, skip the win% estimate
+```
+
+For each legal move (including the start-of-game **signalling** decisions) it
+prints two numbers:
+
+- **bot instinct** — the policy's probability of choosing that move, and
+- **win %** — the team's win probability if you make that move and everyone
+  plays the bot's policy from there, measured by Monte-Carlo rollouts of the
+  policy *in your exact deal*. The highest win % is starred as the recommendation.
+
+These can disagree, which is the whole point: the rollouts correct the policy's
+greedy reflex and show the genuinely best continuation. In-game commands: `h`
+(hint), `d` (deeper 200-rollout analysis), `f` (fork explorer, below), `q`
+(quit). When you diverge from the bot it tells you the win-probability you
+gained or gave up, and recaps every divergence at the end of the mission.
+
+### Fork & explore ("what if I'd played…?")
+
+Press `f` at any of your decisions to open a **fork explorer** — a sandbox that
+never touches the real game. Pick a move and watch the line play out (the bot
+fills the other seats); `auto` lets the bot finish the line so you see whether it
+**WINS ✅ or LOSES ❌**. Then `back` rewinds to try a different move, branching
+freely; you can descend through several of your own future decisions and step
+back up one at a time. A running table compares every line you've tried. When you
+like a line, `commit` plays its first move for real; `done` leaves without
+committing. Explorer commands: `#` (try a move), `auto`, `back`, `root` (restart
+from the fork point), `commit`, `done`. It loads `~/.cache/crewbot/ppo_model.pt` by
+default (`--ckpt` to override); with no checkpoint it falls back to the heuristic
+so you can still play.
+
 ## Running on GaTech PACE
 
 Recommended: two jobs, so you don't reserve a GPU during the 24h of CPU
