@@ -27,5 +27,6 @@ results.tsv
 *.err
 run.log
 *.pt
+!ppo_real_model.pt
 .cache/
 *.log

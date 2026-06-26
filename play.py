@@ -43,6 +43,9 @@ except Exception:                                       # pragma: no cover
 
 import crew_engine as E
 
+# Checkpoint search order: repo dir (git-tracked copy), then the local cache.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Torch is only needed for the neural bot; degrade gracefully to the heuristic.
 try:
     import torch
@@ -627,7 +630,10 @@ def main():
                     help="your seat (default: the commander)")
     ap.add_argument("--rollouts", type=int, default=60,
                     help="rollouts/move for the win%% estimate (0 = off, faster)")
-    ap.add_argument("--ckpt", type=str, default=os.path.join(E.CACHE_DIR, "ppo_real_model.pt"))
+    _repo_ckpt  = os.path.join(_SCRIPT_DIR, "ppo_real_model.pt")
+    _cache_ckpt = os.path.join(E.CACHE_DIR,  "ppo_real_model.pt")
+    _default_ckpt = _repo_ckpt if os.path.exists(_repo_ckpt) else _cache_ckpt
+    ap.add_argument("--ckpt", type=str, default=_default_ckpt)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--blind", action="store_true",
