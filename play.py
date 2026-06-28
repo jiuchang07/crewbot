@@ -565,14 +565,17 @@ def play_game(mission_id, human_seat, bot, rollouts, seed=None, blind=False):
     divergences = []
     last_trick_count = 0
     while not s.done:
-        actor, in_comm = s.turn, s.comm_phase
+        actor, in_comm, in_dist = s.turn, s.comm_phase, s.dist_phase
         if s.turn == human_seat:
             render_board(s, human_seat)
             a = human_decision(s, bot, human_seat, rollouts, divergences, blind=blind)
             E.step(s, a)
         else:
             a = bot.greedy_action(s)
-            if s.comm_phase:
+            if s.dist_phase:
+                c = a - E.CLAIM_OFFSET
+                print(_c(f"  P{s.turn} claims task {card_str(c)}.", "90"))
+            elif s.comm_phase:
                 if a == E.PASS_ACTION:
                     print(_c(f"  P{s.turn} passes (no signal).", "90"))
                 else:
@@ -581,7 +584,7 @@ def play_game(mission_id, human_seat, bot, rollouts, seed=None, blind=False):
                 print(_c(f"  P{s.turn} plays {card_str(a)}.", "90"))
             E.step(s, a)
 
-        if not in_comm:
+        if not in_comm and not in_dist:
             cur_trick.append((actor, a))
 
         # announce a resolved trick

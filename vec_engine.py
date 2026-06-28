@@ -101,6 +101,106 @@ class VecCrew:
                   for b in range(B)]
         return cls.from_scalar(states, device=device)
 
+    # --------------------------------------------------------------- Other-Play
+    @staticmethod
+    def build_perm_table(color_perms, device="cpu"):
+        """Build a full card-index permutation table from color permutations.
+
+        Args:
+            color_perms: [B, 4] long tensor — a permutation of {0,1,2,3} per game.
+        Returns:
+            perm: [B, N_C] long tensor mapping old card index → new card index.
+            inv:  [B, N_C] long tensor mapping new card index → old card index.
+        """
+        B = color_perms.shape[0]
+        RPC = E.RANKS_PER_COLOR  # 9
+        # For non-trump cards: new_index = perm_color[old_color] * 9 + old_rank_offset
+        old_idx = torch.arange(N_C, device=device).unsqueeze(0).expand(B, -1)  # [B, N_C]
+        perm = old_idx.clone()
+        # Only remap non-trump cards (indices 0..35)
+        old_color = old_idx[:, :N_TC] // RPC          # [B, 36]
+        rank_off  = old_idx[:, :N_TC] % RPC           # [B, 36]
+        new_color = color_perms.gather(1, old_color)   # [B, 36]
+        perm[:, :N_TC] = new_color * RPC + rank_off
+        # Build inverse: inv[perm[i]] = i
+        inv = torch.zeros_like(perm)
+        inv.scatter_(1, perm, old_idx)
+        return perm, inv
+
+    def permute_colors(self, color_perms):
+        """Apply a random color permutation (Other-Play) to all game state tensors.
+
+        Args:
+            color_perms: [B, 4] long tensor — a permutation of {0,1,2,3} per game.
+
+        Mutates self in-place and returns self for chaining.
+        """
+        perm, inv = self.build_perm_table(color_perms, device=self.device)
+
+        # Helper: remap a [B, N_C] tensor indexed by card slot.
+        # card-indexed tensors have semantics like "value at card slot c" — we want
+        # the value that was at old slot c to move to new slot perm[c].
+        # Equivalently, new[b, perm[b,c]] = old[b, c]  →  new[b, j] = old[b, inv[b,j]]
+        def remap_card_slots(t):
+            return t.gather(1, inv)
+
+        # Helper: remap a tensor that *stores* card indices as values.
+        # E.g. table[b, j] = card_index → should become perm[card_index].
+        # Entries with sentinel -1 are left unchanged.
+        def remap_card_values(t):
+            valid = t >= 0
+            flat_perm = perm  # [B, N_C]
+            # Clamp for safe indexing, then mask
+            safe = t.clamp(min=0)
+            # Gather from perm along the card dimension
+            remapped = flat_perm.gather(1, safe) if safe.shape[1] == perm.shape[1] else \
+                       torch.stack([perm[b, safe[b]] for b in range(self.B)])
+            return torch.where(valid, remapped, t)
+
+        def remap_card_values_small(t):
+            """Remap a [B, K] tensor of card-index values (K < N_C) using perm."""
+            valid = t >= 0
+            safe = t.clamp(min=0)
+            remapped = torch.stack([perm[b].gather(0, safe[b]) for b in range(self.B)])
+            return torch.where(valid, remapped, t)
+
+        # 1. owner[B, N_C]: who holds card c → remap card slots
+        self.owner = remap_card_slots(self.owner)
+
+        # 2. assigned[B, N_C]: task assignment per card → remap card slots
+        self.assigned = remap_card_slots(self.assigned)
+
+        # 3. is_task[B, N_C]: bool per card → remap card slots
+        self.is_task = remap_card_slots(self.is_task)
+
+        # 4. pred[B, N_C, N_C]: pred[b,c,d] = d must precede c → remap both axes
+        # new_pred[b, perm[c], perm[d]] = old_pred[b, c, d]
+        # → new_pred[b, i, j] = old_pred[b, inv[i], inv[j]]
+        self.pred = self.pred.gather(1, inv.unsqueeze(2).expand_as(self.pred))
+        self.pred = self.pred.gather(2, inv.unsqueeze(1).expand_as(self.pred))
+
+        # 5. done_tasks[B, N_C]: bool per card → remap card slots
+        self.done_tasks = remap_card_slots(self.done_tasks)
+
+        # 6. captured_by[B, N_C]: who captured card c → remap card slots
+        self.captured_by = remap_card_slots(self.captured_by)
+
+        # 7. table[B, N_P]: stores card indices → remap card values
+        self.table = remap_card_values_small(self.table)
+
+        # 8. comm_card[B, N_P]: stores card indices → remap card values
+        self.comm_card = remap_card_values_small(self.comm_card)
+
+        # 9. led[B]: stores color index → remap via color_perms
+        has_led = self.led >= 0
+        # led stores a color (0-3) or -1; trumps have led_color = TRUMP_COLOR (4) 
+        is_normal_color = has_led & (self.led < E.N_COLORS)
+        safe_led = self.led.clamp(min=0)
+        new_led = color_perms[self.arangeB, safe_led]
+        self.led = torch.where(is_normal_color, new_led, self.led)
+
+        return self
+
     # ------------------------------------------------------------------- moves
     def _comm_table(self):
         """Per current player: (comm_legal [B,N_C] bool, comm_type [B,N_C] long)."""
